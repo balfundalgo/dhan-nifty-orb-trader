@@ -3,3 +3,4 @@ websocket-client==1.7.0
 pyotp==2.9.0
 python-dotenv==1.0.0
 schedule==1.2.1
+customtkinter==5.2.2

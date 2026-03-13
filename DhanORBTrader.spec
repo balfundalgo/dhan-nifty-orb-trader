@@ -1,49 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
-# DhanORBTrader.spec
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 a = Analysis(
-    ['nifty_papertrade_orb_supertrend_OPTIONS_v9_ws_optionticks.py'],
+    ['dhan_orb_trader.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[
-        'websocket',
-        'websocket._core',
-        'websocket._abnf',
-        'websocket._exceptions',
-        'requests',
-        'pyotp',
-        'csv',
-        'struct',
-        'json',
-        'threading',
-        'collections',
-    ],
+    datas=collect_data_files('customtkinter'),
+    hiddenimports=(
+        collect_submodules('customtkinter') + [
+            'websocket', 'websocket._core', 'websocket._abnf',
+            'websocket._exceptions', 'requests', 'pyotp',
+            'tkinter', 'tkinter.messagebox',
+            'csv', 'struct', 'json', 'threading', 'collections',
+        ]
+    ),
     hookspath=[],
-    hooksconfig={},
     runtime_hooks=[],
     excludes=[],
     noarchive=False,
 )
-
 pyz = PYZ(a.pure)
-
 exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
+    pyz, a.scripts, a.binaries, a.datas, [],
     name='DhanORBTrader',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
+    debug=False, strip=False, upx=True,
+    console=False,
     runtime_tmpdir=None,
-    console=True,      # console app — shows terminal output
-    disable_windowed_traceback=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
 )
