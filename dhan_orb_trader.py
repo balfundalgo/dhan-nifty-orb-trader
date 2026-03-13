@@ -1296,13 +1296,15 @@ class App:
         self.subscribed_secids: set[str] = set(_engine_key(str(inst['security_id']), inst['exchange']) for inst in self.selected)
 
     def _resolve_selected_instruments(self) -> List[Dict[str, Any]]:
-        if TRADE_MODE in TRADE_MODE_GROUPS:
-            keys = TRADE_MODE_GROUPS[TRADE_MODE]
-        elif TRADE_MODE in INSTRUMENTS:
-            keys = [TRADE_MODE]
+        # Always read from os.environ so GUI mode changes take effect at runtime
+        mode = os.getenv('TRADE_MODE', 'NIFTY').strip().upper()
+        if mode in TRADE_MODE_GROUPS:
+            keys = TRADE_MODE_GROUPS[mode]
+        elif mode in INSTRUMENTS:
+            keys = [mode]
         else:
             valid = list(INSTRUMENTS.keys()) + list(TRADE_MODE_GROUPS.keys())
-            raise SystemExit(f'TRADE_MODE={TRADE_MODE!r} is invalid. Valid options: {valid}')
+            raise SystemExit(f'TRADE_MODE={mode!r} is invalid. Valid options: {valid}')
         selected = [INSTRUMENTS[k] for k in keys]
         # Warn if any stock has security_id still '0' (resolver failed)
         for inst in selected:
@@ -1481,9 +1483,9 @@ class App:
 
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  GUI — CustomTkinter Dashboard
-#  Layout: top bar → dashboard table (all instruments) → trade log panel
+#  GUI — CustomTkinter  |  Two-page layout: CREDENTIALS  ↔  LIVE TRADING
 # ══════════════════════════════════════════════════════════════════════════════
 import tkinter as tk
 import tkinter.messagebox as mb
@@ -1492,10 +1494,8 @@ from pathlib import Path
 try:
     import customtkinter as ctk
 except ImportError:
-    import tkinter as _tk
-    _tk.Tk().withdraw()
-    mb.showerror("Missing Package",
-        "customtkinter is not installed.\n\nRun:  pip install customtkinter")
+    import tkinter as _tk; _tk.Tk().withdraw()
+    mb.showerror("Missing Package", "Run: pip install customtkinter")
     raise SystemExit(1)
 
 try:
@@ -1503,498 +1503,411 @@ try:
 except ImportError:
     _pyotp = None
 
-# ── resolve paths relative to exe ────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
     BASE_DIR = Path(sys.executable).parent
 else:
     BASE_DIR = Path(__file__).parent
 ENV_PATH = BASE_DIR / '.env'
 
-# ── colours ───────────────────────────────────────────────────────────────────
-BG     = "#0d1117"
-PANEL  = "#161b22"
-DARK   = "#1c2128"
-BORDER = "#30363d"
-ACCENT = "#58a6ff"
-GREEN  = "#3fb950"
-RED    = "#f85149"
-YELLOW = "#d29922"
-WHITE  = "#e6edf3"
-MUTED  = "#8b949e"
-MONO   = "Courier New"
+# ── palette ───────────────────────────────────────────────────────────────────
+BG='#0d1117'; PANEL='#161b22'; DARK='#1c2128'; BORDER='#30363d'
+ACCENT='#58a6ff'; GREEN='#3fb950'; RED='#f85149'
+YELLOW='#d29922'; WHITE='#e6edf3'; MUTED='#8b949e'
+MONO='Courier New'
 
-def _fmt(v, p=2): return f"{v:,.{p}f}" if v is not None else "—"
-def _pnl_col(v):  return GREEN if (v or 0) > 0 else (RED if (v or 0) < 0 else WHITE)
-def _sgn(v):      return "+" if (v or 0) >= 0 else ""
+def _fmt(v,p=2): return f"{v:,.{p}f}" if v is not None else '—'
+def _pnl_col(v): return GREEN if (v or 0)>0 else (RED if (v or 0)<0 else WHITE)
+def _sgn(v):     return '+' if (v or 0)>=0 else ''
 
 def _save_env(**kw):
-    ex = {}
+    ex={}
     try:
         for raw in ENV_PATH.read_text(encoding='utf-8').splitlines():
-            s = raw.strip()
+            s=raw.strip()
             if not s or s.startswith('#') or '=' not in s: continue
-            k, v = s.split('=', 1)
-            ex[k.strip()] = v.strip()
+            k,v=s.split('=',1); ex[k.strip()]=v.strip()
     except Exception: pass
     ex.update(kw)
     ENV_PATH.write_text('\n'.join(f"{k}={v}" for k,v in ex.items())+'\n', encoding='utf-8')
-    for k, v in kw.items(): os.environ[k] = v
+    for k,v in kw.items(): os.environ[k]=v
 
 def _creds_ok():
-    cid = os.getenv('DHAN_CLIENT_ID','').strip()
-    tok = os.getenv('DHAN_ACCESS_TOKEN','').strip()
-    return bool(cid and tok and cid != '__PLACEHOLDER__' and tok != '__PLACEHOLDER__')
+    c=os.getenv('DHAN_CLIENT_ID','').strip()
+    t=os.getenv('DHAN_ACCESS_TOKEN','').strip()
+    return bool(c and t and c!='__PLACEHOLDER__' and t!='__PLACEHOLDER__')
+
+# ── dashboard table columns ────────────────────────────────────────────────────
+COL_W={'name':130,'ltp':100,'chg':85,'orb_h':78,'orb_l':78,'st':80,
+       'trend':65,'pos':160,'entry':68,'last_p':68,'unreal':95,'real':95,'note':190}
+COLS=list(COL_W.keys())
+COL_HDR={'name':'INSTRUMENT','ltp':'LTP','chg':'CHG%','orb_h':'ORB H',
+         'orb_l':'ORB L','st':'ST','trend':'TREND','pos':'POSITION',
+         'entry':'ENTRY P','last_p':'LAST P','unreal':'UNREAL ₹',
+         'real':'REAL ₹','note':'STATUS'}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CREDENTIALS + TOKEN GENERATOR DIALOG
+#  DASHBOARD TABLE ROW
 # ══════════════════════════════════════════════════════════════════════════════
-class CredentialsDialog(ctk.CTkToplevel):
-    def __init__(self, parent, on_saved=None):
-        super().__init__(parent)
-        self.on_saved = on_saved or (lambda: None)
-        self.title("Credentials & Token Generator")
-        self.geometry("560x580")
-        self.resizable(False, False)
-        self.configure(fg_color=BG)
-        self.grab_set(); self.lift()
-
-        ctk.CTkLabel(self, text="Dhan API Credentials",
-            font=ctk.CTkFont(MONO, 17, "bold"), text_color=ACCENT).pack(pady=(20,2))
-        ctk.CTkLabel(self, text="web.dhan.co → Profile → API Access",
-            font=ctk.CTkFont(MONO, 11), text_color=MUTED).pack(pady=(0,12))
-
-        frm = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
-        frm.pack(fill="x", padx=24)
-
-        def _row(label, env_key, show="", width=300):
-            r = ctk.CTkFrame(frm, fg_color="transparent")
-            r.pack(fill="x", padx=14, pady=5)
-            ctk.CTkLabel(r, text=label, width=155, anchor="w",
-                font=ctk.CTkFont(MONO, 12), text_color=MUTED).pack(side="left")
-            e = ctk.CTkEntry(r, show=show, width=width,
-                font=ctk.CTkFont(MONO, 12),
-                fg_color=DARK, border_color=BORDER, text_color=WHITE)
-            val = os.getenv(env_key, '')
-            if val and val not in ('__PLACEHOLDER__',):
-                e.insert(0, val)
-            e.pack(side="left")
-            return e
-
-        self.e_cid  = _row("Client ID",     "DHAN_CLIENT_ID")
-        self.e_pin  = _row("PIN (4-digit)", "DHAN_PIN",  "•")
-        self.e_totp = _row("TOTP Secret",   "DHAN_TOTP_SECRET", "•")
-
-        # Token row with generate button
-        tr = ctk.CTkFrame(frm, fg_color="transparent")
-        tr.pack(fill="x", padx=14, pady=5)
-        ctk.CTkLabel(tr, text="Access Token", width=155, anchor="w",
-            font=ctk.CTkFont(MONO, 12), text_color=MUTED).pack(side="left")
-        self.e_tok = ctk.CTkEntry(tr, show="•", width=210,
-            font=ctk.CTkFont(MONO, 12),
-            fg_color=DARK, border_color=BORDER, text_color=WHITE)
-        val = os.getenv('DHAN_ACCESS_TOKEN','')
-        if val and val not in ('__PLACEHOLDER__',):
-            self.e_tok.insert(0, val)
-        self.e_tok.pack(side="left")
-        self.btn_gen = ctk.CTkButton(tr, text="⚡ Generate", width=88,
-            font=ctk.CTkFont(MONO, 11, "bold"),
-            fg_color=YELLOW, text_color=BG, hover_color="#e3b341",
-            command=self._generate_token)
-        self.btn_gen.pack(side="left", padx=(6,0))
-
-        # Status label
-        self.lbl_status = ctk.CTkLabel(self, text="",
-            font=ctk.CTkFont(MONO, 11), text_color=MUTED)
-        self.lbl_status.pack(pady=(10,0))
-
-        self.lbl_err = ctk.CTkLabel(self, text="",
-            font=ctk.CTkFont(MONO, 11), text_color=RED)
-        self.lbl_err.pack()
-
-        # Token info box
-        self.info_box = ctk.CTkTextbox(self, height=60,
-            fg_color=DARK, border_color=BORDER,
-            font=ctk.CTkFont(MONO, 10), text_color=MUTED, state="disabled")
-        self.info_box.pack(fill="x", padx=24, pady=(6,0))
-
-        ctk.CTkButton(self, text="Save & Close", height=38,
-            font=ctk.CTkFont(MONO, 13, "bold"),
-            fg_color=ACCENT, text_color=BG, hover_color="#79c0ff",
-            command=self._save).pack(pady=16)
-
-    def _set_status(self, msg, color=MUTED):
-        self.lbl_status.configure(text=msg, text_color=color)
-        self.update()
-
-    def _set_info(self, text):
-        self.info_box.configure(state="normal")
-        self.info_box.delete("1.0","end")
-        self.info_box.insert("end", text)
-        self.info_box.configure(state="disabled")
-
-    def _generate_token(self):
-        if _pyotp is None:
-            self.lbl_err.configure(text="pyotp not installed — run: pip install pyotp")
-            return
-        cid  = self.e_cid.get().strip()
-        pin  = self.e_pin.get().strip()
-        totp_s = self.e_totp.get().strip()
-        if not cid:
-            self.lbl_err.configure(text="Client ID required"); return
-        if not pin or not totp_s:
-            self.lbl_err.configure(text="PIN and TOTP Secret required to generate token"); return
-
-        self.lbl_err.configure(text="")
-        self.btn_gen.configure(state="disabled", text="⏳ Generating…")
-        self._set_status("Generating TOTP code…", YELLOW)
-
-        def _do():
-            try:
-                totp_code = _pyotp.TOTP(totp_s).now()
-                url = (f"https://auth.dhan.co/app/generateAccessToken"
-                       f"?dhanClientId={cid}&pin={pin}&totp={totp_code}")
-                r = requests.post(url, timeout=15)
-                data = r.json()
-                if "accessToken" in data:
-                    tok    = data["accessToken"]
-                    expiry = data.get("expiryTime","")
-                    name   = data.get("dhanClientName","")
-                    # fill token field
-                    self.after(0, lambda: [
-                        self.e_tok.delete(0,"end"),
-                        self.e_tok.insert(0, tok),
-                        self.lbl_status.configure(
-                            text=f"✅ Token generated successfully!", text_color=GREEN),
-                        self.lbl_err.configure(text=""),
-                        self._set_info(
-                            f"Client  : {name}\n"
-                            f"Expires : {expiry}\n"
-                            f"TOTP    : {totp_code}"),
-                        self.btn_gen.configure(state="normal", text="⚡ Generate"),
-                    ])
-                else:
-                    err = str(data)
-                    self.after(0, lambda: [
-                        self.lbl_err.configure(text=f"Failed: {err[:80]}"),
-                        self._set_status("", MUTED),
-                        self.btn_gen.configure(state="normal", text="⚡ Generate"),
-                    ])
-            except Exception as e:
-                msg = str(e)
-                self.after(0, lambda: [
-                    self.lbl_err.configure(text=f"Error: {msg[:80]}"),
-                    self._set_status("", MUTED),
-                    self.btn_gen.configure(state="normal", text="⚡ Generate"),
-                ])
-
-        threading.Thread(target=_do, daemon=True).start()
-
-    def _save(self):
-        cid  = self.e_cid.get().strip()
-        tok  = self.e_tok.get().strip()
-        pin  = self.e_pin.get().strip()
-        totp = self.e_totp.get().strip()
-        if not cid:
-            self.lbl_err.configure(text="Client ID required"); return
-        if not tok:
-            self.lbl_err.configure(
-                text="Access Token required — click ⚡ Generate or paste manually"); return
-        _save_env(DHAN_CLIENT_ID=cid, DHAN_ACCESS_TOKEN=tok,
-                  DHAN_PIN=pin, DHAN_TOTP_SECRET=totp)
-        _load_dotenv_fallback(str(ENV_PATH))
-        self.destroy()
-        self.on_saved()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DASHBOARD TABLE ROW  (one row per instrument in a shared table)
-# ══════════════════════════════════════════════════════════════════════════════
-# Column widths
-COL_W = {
-    'name':    130, 'ltp':  100, 'chg':   90,
-    'orb_h':   80,  'orb_l': 80, 'st':    80,
-    'trend':   70,  'pos':  160, 'entry': 70,
-    'last_p':  70,  'unreal':100,'real':  100,
-    'note':    200,
-}
-COLS = list(COL_W.keys())
-COL_LABELS = {
-    'name':'INSTRUMENT','ltp':'LTP','chg':'CHG %',
-    'orb_h':'ORB H','orb_l':'ORB L','st':'ST',
-    'trend':'TREND','pos':'POSITION','entry':'ENTRY P',
-    'last_p':'LAST P','unreal':'UNREAL ₹','real':'REAL ₹',
-    'note':'STATUS',
-}
-
 class DashboardRow:
-    """One row of labels in the shared instrument table."""
-    def __init__(self, parent, inst: dict, row_idx: int):
-        self.inst = inst
-        bg = DARK if row_idx % 2 == 0 else PANEL
-        self.frame = ctk.CTkFrame(parent, fg_color=bg, corner_radius=0, height=32)
-        self.frame.pack(fill="x")
+    def __init__(self, parent, inst, idx):
+        self.inst=inst
+        bg=DARK if idx%2==0 else PANEL
+        self.frame=ctk.CTkFrame(parent, fg_color=bg, corner_radius=0, height=32)
+        self.frame.pack(fill='x')
         self.frame.pack_propagate(False)
-        self.cells: dict[str, ctk.CTkLabel] = {}
+        self.cells={}
         for col in COLS:
-            lbl = ctk.CTkLabel(self.frame, text="—",
-                width=COL_W[col], anchor="e" if col not in ('name','pos','note','trend') else "w",
-                font=ctk.CTkFont(MONO, 11), text_color=WHITE)
-            lbl.pack(side="left", padx=2)
-            self.cells[col] = lbl
-        # instrument name never changes
+            anch='w' if col in ('name','pos','note','trend') else 'e'
+            lbl=ctk.CTkLabel(self.frame, text='—', width=COL_W[col], anchor=anch,
+                font=ctk.CTkFont(MONO,11), text_color=WHITE)
+            lbl.pack(side='left', padx=2)
+            self.cells[col]=lbl
         self.cells['name'].configure(text=inst['name'], text_color=ACCENT)
 
-    def update(self, snap: dict):
-        inst  = snap['instrument']
-        ltp   = snap['last_ltp']
-        prev  = snap['prev_close']
-
-        # LTP + change
+    def update(self, snap):
+        inst=snap['instrument']; ltp=snap['last_ltp']; prev=snap['prev_close']
         if ltp is not None:
             self.cells['ltp'].configure(text=f"{ltp:,.2f}", text_color=WHITE)
         if ltp is not None and prev:
-            chg = (ltp - prev) / prev * 100
-            col = GREEN if chg >= 0 else RED
-            self.cells['chg'].configure(
-                text=f"{_sgn(chg)}{chg:.2f}%", text_color=col)
-
-        # ORB
-        orb_rdy = snap['orb_ready']
-        self.cells['orb_h'].configure(
-            text=_fmt(snap['orb_high']),
+            chg=(ltp-prev)/prev*100
+            col=GREEN if chg>=0 else RED
+            self.cells['chg'].configure(text=f"{_sgn(chg)}{chg:.2f}%", text_color=col)
+        orb_rdy=snap['orb_ready']
+        self.cells['orb_h'].configure(text=_fmt(snap['orb_high']),
             text_color=GREEN if orb_rdy else MUTED)
-        self.cells['orb_l'].configure(
-            text=_fmt(snap['orb_low']),
+        self.cells['orb_l'].configure(text=_fmt(snap['orb_low']),
             text_color=RED if orb_rdy else MUTED)
-
-        # ST
-        st_dir = snap['st_dir']
         self.cells['st'].configure(text=_fmt(snap['st_value']))
+        st_dir=snap['st_dir']
         if st_dir is not None:
-            up = int(st_dir) > 0
-            self.cells['trend'].configure(
-                text="▲ UP" if up else "▼ DN",
+            up=int(st_dir)>0
+            self.cells['trend'].configure(text='▲ UP' if up else '▼ DN',
                 text_color=GREEN if up else RED)
         else:
-            self.cells['trend'].configure(text="—", text_color=MUTED)
-
-        # Position
-        pos = snap['position']
+            self.cells['trend'].configure(text='—', text_color=MUTED)
+        pos=snap['position']
         if pos:
-            strike = snap['entry_strike']
-            sym = f"{inst['option_prefix']} {pos} {strike}"
             self.cells['pos'].configure(
-                text=sym, text_color=GREEN if pos=='CE' else RED)
-            self.cells['entry'].configure(
-                text=_fmt(snap.get('entry_option_price')), text_color=MUTED)
-            self.cells['last_p'].configure(
-                text=_fmt(snap.get('current_option_price')), text_color=WHITE)
-            ur = snap.get('unrealized_pnl_rupees') or 0.0
-            rr = snap.get('realized_pnl_rupees') or 0.0
-            self.cells['unreal'].configure(
-                text=f"{_sgn(ur)}₹{ur:,.0f}", text_color=_pnl_col(ur))
-            self.cells['real'].configure(
-                text=f"{_sgn(rr)}₹{rr:,.0f}", text_color=_pnl_col(rr))
+                text=f"{inst['option_prefix']} {pos} {snap['entry_strike']}",
+                text_color=GREEN if pos=='CE' else RED)
+            self.cells['entry'].configure(text=_fmt(snap.get('entry_option_price')), text_color=MUTED)
+            self.cells['last_p'].configure(text=_fmt(snap.get('current_option_price')), text_color=WHITE)
+            ur=snap.get('unrealized_pnl_rupees') or 0.0
+            rr=snap.get('realized_pnl_rupees') or 0.0
+            self.cells['unreal'].configure(text=f"{_sgn(ur)}₹{ur:,.0f}", text_color=_pnl_col(ur))
+            self.cells['real'].configure(text=f"{_sgn(rr)}₹{rr:,.0f}", text_color=_pnl_col(rr))
         else:
-            self.cells['pos'].configure(text="No position", text_color=MUTED)
-            self.cells['entry'].configure(text="—", text_color=MUTED)
-            self.cells['last_p'].configure(text="—", text_color=MUTED)
-            self.cells['unreal'].configure(text="—", text_color=MUTED)
-            rr = snap.get('realized_pnl_rupees') or 0.0
+            self.cells['pos'].configure(text='No position', text_color=MUTED)
+            for c in ('entry','last_p','unreal'): self.cells[c].configure(text='—', text_color=MUTED)
+            rr=snap.get('realized_pnl_rupees') or 0.0
             self.cells['real'].configure(
-                text=f"{_sgn(rr)}₹{rr:,.0f}" if rr else "—",
-                text_color=_pnl_col(rr))
-
-        # Status note
-        self.cells['note'].configure(
-            text=(snap.get('note') or '')[:30], text_color=YELLOW)
+                text=f"{_sgn(rr)}₹{rr:,.0f}" if rr else '—', text_color=_pnl_col(rr))
+        self.cells['note'].configure(text=(snap.get('note') or '')[:28], text_color=YELLOW)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TRADE LOG PANEL  (shared — shows all instruments' trades)
-# ══════════════════════════════════════════════════════════════════════════════
-class TradeLogPanel(ctk.CTkFrame):
-    def __init__(self, parent):
-        super().__init__(parent, fg_color=PANEL, corner_radius=8)
-        ctk.CTkLabel(self, text="Trade Log — All Instruments",
-            font=ctk.CTkFont(MONO, 11, "bold"),
-            text_color=ACCENT, anchor="w").pack(fill="x", padx=10, pady=(6,2))
-        self.box = ctk.CTkTextbox(self, fg_color=DARK, border_color=BORDER,
-            font=ctk.CTkFont(MONO, 11), text_color=WHITE, state="disabled")
-        self.box.pack(fill="both", expand=True, padx=8, pady=(0,8))
-
-    def update_all(self, snaps: list[dict]):
-        lines = []
-        for snap in snaps:
-            name = snap['instrument']['name']
-            for row in snap['trade_log'][:5]:
-                lines.append(f"[{name}]  {row}")
-        # Sort by time prefix (HH:MM)
-        lines.sort(reverse=True)
-        self.box.configure(state="normal")
-        self.box.delete("1.0","end")
-        self.box.insert("end", '\n'.join(lines) if lines else "No trades yet.")
-        self.box.configure(state="disabled")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FORMING CANDLES PANEL
-# ══════════════════════════════════════════════════════════════════════════════
-class FormingCandlesPanel(ctk.CTkFrame):
-    def __init__(self, parent):
-        super().__init__(parent, fg_color=PANEL, corner_radius=8)
-        ctk.CTkLabel(self, text="Forming 3m Candles",
-            font=ctk.CTkFont(MONO, 11, "bold"),
-            text_color=ACCENT, anchor="w").pack(fill="x", padx=10, pady=(6,2))
-        self.box = ctk.CTkTextbox(self, fg_color=DARK, border_color=BORDER,
-            font=ctk.CTkFont(MONO, 11), text_color=WHITE,
-            height=110, state="disabled")
-        self.box.pack(fill="x", padx=8, pady=(0,8))
-
-    def update_all(self, snaps: list[dict]):
-        lines = []
-        for snap in snaps:
-            name = snap['instrument']['name']
-            c3   = snap['current_3m']
-            nxt  = snap.get('next_eval') or '—'
-            if c3:
-                t = epoch_to_local_str(c3['bucket'], False)
-                line = (f"{name:<18}  [{t}]  "
-                        f"O:{c3['open']:.1f}  H:{c3['high']:.1f}  "
-                        f"L:{c3['low']:.1f}  C:{c3['close']:.1f}  "
-                        f"parts:{c3.get('parts',0)}/3  next:{nxt}")
-            else:
-                line = f"{name:<18}  awaiting candle…  next:{nxt}"
-            lines.append(line)
-        self.box.configure(state="normal")
-        self.box.delete("1.0","end")
-        self.box.insert("end", '\n'.join(lines) if lines else "—")
-        self.box.configure(state="disabled")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN WINDOW
+#  MAIN WINDOW  —  two pages via a segmented button switcher in the top bar
 # ══════════════════════════════════════════════════════════════════════════════
 class MainWindow(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Dhan ORB + Supertrend — Paper Trader  |  Balfund Trading")
-        self.geometry("1400x860")
-        self.minsize(1100, 640)
+        self.title('Dhan ORB + Supertrend Paper Trader  |  Balfund Trading')
+        self.geometry('1400x860')
+        self.minsize(1100,640)
         self.configure(fg_color=BG)
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
+        ctk.set_appearance_mode('dark')
+        ctk.set_default_color_theme('blue')
 
-        self._app: 'App | None' = None
-        self._running = False
-        self._rows: dict[str, DashboardRow] = {}
+        self._app=None; self._running=False; self._rows={}
 
         self._build_topbar()
-        self._build_dashboard()
-        self._build_bottom()
+        # page frames
+        self.page_creds   = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        self.page_trading = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        self._build_creds_page()
+        self._build_trading_page()
         self._build_statusbar()
-
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._show_page('credentials' if not _creds_ok() else 'trading')
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
         self._tick()
 
     # ── top bar ──────────────────────────────────────────────────────────────
     def _build_topbar(self):
-        bar = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=54)
-        bar.pack(fill="x")
+        bar=ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=54)
+        bar.pack(fill='x')
         bar.pack_propagate(False)
 
-        ctk.CTkLabel(bar, text="◈  DHAN ORB PAPER TRADER",
-            font=ctk.CTkFont(MONO, 15, "bold"),
-            text_color=ACCENT).pack(side="left", padx=16)
+        ctk.CTkLabel(bar, text='◈  DHAN ORB PAPER TRADER',
+            font=ctk.CTkFont(MONO,15,'bold'), text_color=ACCENT).pack(side='left', padx=16)
 
-        self.lbl_clock = ctk.CTkLabel(bar, text="",
-            font=ctk.CTkFont(MONO, 12), text_color=MUTED)
-        self.lbl_clock.pack(side="left", padx=10)
+        self.lbl_clock=ctk.CTkLabel(bar, text='',
+            font=ctk.CTkFont(MONO,12), text_color=MUTED)
+        self.lbl_clock.pack(side='left', padx=10)
 
-        ctk.CTkButton(bar, text="⚙  Credentials", width=140,
-            font=ctk.CTkFont(MONO, 12),
-            fg_color=BORDER, hover_color=DARK, text_color=WHITE,
-            command=self._open_creds).pack(side="right", padx=8, pady=9)
+        # page switcher
+        self.page_seg=ctk.CTkSegmentedButton(bar,
+            values=['⚙  Credentials','📊  Live Trading'],
+            font=ctk.CTkFont(MONO,12),
+            fg_color=DARK, selected_color=ACCENT, selected_hover_color='#79c0ff',
+            unselected_color=DARK, unselected_hover_color=BORDER,
+            text_color=WHITE, text_color_disabled=MUTED,
+            command=self._on_page_switch)
+        self.page_seg.pack(side='left', padx=20, pady=10)
 
-        self.btn_start = ctk.CTkButton(bar, text="▶  START", width=130,
-            font=ctk.CTkFont(MONO, 13, "bold"),
-            fg_color=GREEN, text_color=BG, hover_color="#56d364",
+        # start/stop (right side)
+        self.btn_start=ctk.CTkButton(bar, text='▶  START', width=130,
+            font=ctk.CTkFont(MONO,13,'bold'),
+            fg_color=GREEN, text_color=BG, hover_color='#56d364',
             command=self._toggle)
-        self.btn_start.pack(side="right", padx=4, pady=9)
+        self.btn_start.pack(side='right', padx=8, pady=9)
 
-        all_modes = list(INSTRUMENTS.keys()) + list(TRADE_MODE_GROUPS.keys())
-        self.mode_var = ctk.StringVar(value=os.getenv('TRADE_MODE','NIFTY'))
+        all_modes=list(INSTRUMENTS.keys())+list(TRADE_MODE_GROUPS.keys())
+        self.mode_var=ctk.StringVar(value=os.getenv('TRADE_MODE','NIFTY'))
         ctk.CTkOptionMenu(bar, values=all_modes, variable=self.mode_var,
-            width=180, font=ctk.CTkFont(MONO, 12),
+            width=180, font=ctk.CTkFont(MONO,12),
             fg_color=DARK, button_color=BORDER,
-            dropdown_fg_color=PANEL, text_color=WHITE).pack(
-            side="right", padx=4, pady=9)
+            dropdown_fg_color=PANEL, text_color=WHITE).pack(side='right', padx=4, pady=9)
+        ctk.CTkLabel(bar, text='MODE:', font=ctk.CTkFont(MONO,11),
+            text_color=MUTED).pack(side='right', padx=(8,0))
 
-        ctk.CTkLabel(bar, text="MODE:", font=ctk.CTkFont(MONO,11),
-            text_color=MUTED).pack(side="right", padx=(8,0))
+    def _on_page_switch(self, val):
+        if 'Credentials' in val: self._show_page('credentials')
+        else:                      self._show_page('trading')
 
-    # ── instrument dashboard table ────────────────────────────────────────────
-    def _build_dashboard(self):
-        outer = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=8)
-        outer.pack(fill="x", padx=8, pady=(6,2))
+    def _show_page(self, name):
+        self.page_creds.pack_forget()
+        self.page_trading.pack_forget()
+        if name=='credentials':
+            self.page_creds.pack(fill='both', expand=True)
+            self.page_seg.set('⚙  Credentials')
+        else:
+            self.page_trading.pack(fill='both', expand=True)
+            self.page_seg.set('📊  Live Trading')
 
-        # Header row
-        hdr = ctk.CTkFrame(outer, fg_color=DARK, corner_radius=0, height=26)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
+    # ══════════════════════════════════════════════════════════════════════════
+    #  CREDENTIALS PAGE
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_creds_page(self):
+        p=self.page_creds
+
+        ctk.CTkLabel(p, text='Dhan API Credentials',
+            font=ctk.CTkFont(MONO,18,'bold'), text_color=ACCENT).pack(pady=(32,4))
+        ctk.CTkLabel(p, text='web.dhan.co  →  Profile  →  API Access',
+            font=ctk.CTkFont(MONO,12), text_color=MUTED).pack(pady=(0,20))
+
+        frm=ctk.CTkFrame(p, fg_color=PANEL, corner_radius=12, width=540)
+        frm.pack(pady=0)
+        frm.pack_propagate(False)
+
+        def _row(label, env_key, show='', w=320):
+            r=ctk.CTkFrame(frm, fg_color='transparent')
+            r.pack(fill='x', padx=20, pady=7)
+            ctk.CTkLabel(r, text=label, width=160, anchor='w',
+                font=ctk.CTkFont(MONO,12), text_color=MUTED).pack(side='left')
+            e=ctk.CTkEntry(r, show=show, width=w,
+                font=ctk.CTkFont(MONO,12),
+                fg_color=DARK, border_color=BORDER, text_color=WHITE)
+            val=os.getenv(env_key,'')
+            if val and val not in ('__PLACEHOLDER__',): e.insert(0,val)
+            e.pack(side='left')
+            return e
+
+        self.e_cid  = _row('Client ID',       'DHAN_CLIENT_ID')
+        self.e_pin  = _row('PIN (4-digit)',    'DHAN_PIN',       '•')
+        self.e_totp = _row('TOTP Secret',      'DHAN_TOTP_SECRET','•')
+
+        # Token row with inline Generate button
+        tr=ctk.CTkFrame(frm, fg_color='transparent')
+        tr.pack(fill='x', padx=20, pady=7)
+        ctk.CTkLabel(tr, text='Access Token', width=160, anchor='w',
+            font=ctk.CTkFont(MONO,12), text_color=MUTED).pack(side='left')
+        self.e_tok=ctk.CTkEntry(tr, show='•', width=220,
+            font=ctk.CTkFont(MONO,12),
+            fg_color=DARK, border_color=BORDER, text_color=WHITE)
+        val=os.getenv('DHAN_ACCESS_TOKEN','')
+        if val and val not in ('__PLACEHOLDER__',): self.e_tok.insert(0,val)
+        self.e_tok.pack(side='left')
+        self.btn_gen=ctk.CTkButton(tr, text='⚡ Generate', width=96,
+            font=ctk.CTkFont(MONO,11,'bold'),
+            fg_color=YELLOW, text_color=BG, hover_color='#e3b341',
+            command=self._gen_token)
+        self.btn_gen.pack(side='left', padx=(6,0))
+
+        # Status + info
+        self.lbl_cred_status=ctk.CTkLabel(p, text='',
+            font=ctk.CTkFont(MONO,12), text_color=MUTED)
+        self.lbl_cred_status.pack(pady=(12,0))
+
+        self.lbl_cred_err=ctk.CTkLabel(p, text='',
+            font=ctk.CTkFont(MONO,11), text_color=RED)
+        self.lbl_cred_err.pack(pady=(2,0))
+
+        self.cred_info=ctk.CTkTextbox(p, height=52, width=540,
+            fg_color=DARK, border_color=BORDER,
+            font=ctk.CTkFont(MONO,10), text_color=MUTED, state='disabled')
+        self.cred_info.pack(pady=(8,0))
+
+        # Save button
+        ctk.CTkButton(p, text='💾  Save Credentials', height=40, width=240,
+            font=ctk.CTkFont(MONO,13,'bold'),
+            fg_color=ACCENT, text_color=BG, hover_color='#79c0ff',
+            command=self._save_creds).pack(pady=20)
+
+        # Token validity badge
+        self.lbl_tok_badge=ctk.CTkLabel(p, text='',
+            font=ctk.CTkFont(MONO,12,'bold'), text_color=MUTED)
+        self.lbl_tok_badge.pack()
+        self._refresh_token_badge()
+
+    def _refresh_token_badge(self):
+        if _creds_ok():
+            self.lbl_tok_badge.configure(
+                text='✅  Token saved — ready to trade', text_color=GREEN)
+        else:
+            self.lbl_tok_badge.configure(
+                text='⚠  No valid token — generate or paste one above', text_color=YELLOW)
+
+    def _set_cred_info(self, text):
+        self.cred_info.configure(state='normal')
+        self.cred_info.delete('1.0','end')
+        self.cred_info.insert('end', text)
+        self.cred_info.configure(state='disabled')
+
+    def _gen_token(self):
+        if _pyotp is None:
+            self.lbl_cred_err.configure(text='pyotp not installed — run: pip install pyotp')
+            return
+        cid   = self.e_cid.get().strip()
+        pin   = self.e_pin.get().strip()
+        totp_s= self.e_totp.get().strip()
+        if not cid:
+            self.lbl_cred_err.configure(text='Client ID required'); return
+        if not pin or not totp_s:
+            self.lbl_cred_err.configure(text='PIN + TOTP Secret required'); return
+        self.lbl_cred_err.configure(text='')
+        self.btn_gen.configure(state='disabled', text='⏳…')
+        self.lbl_cred_status.configure(text='Generating token…', text_color=YELLOW)
+
+        def _do():
+            try:
+                code=_pyotp.TOTP(totp_s).now()
+                url=(f"https://auth.dhan.co/app/generateAccessToken"
+                     f"?dhanClientId={cid}&pin={pin}&totp={code}")
+                r=requests.post(url, timeout=15)
+                data=r.json()
+                if 'accessToken' in data:
+                    tok=data['accessToken']; exp=data.get('expiryTime','')
+                    name=data.get('dhanClientName','')
+                    def _update():
+                        self.e_tok.delete(0,'end'); self.e_tok.insert(0,tok)
+                        self.lbl_cred_status.configure(
+                            text='✅ Token generated!', text_color=GREEN)
+                        self.lbl_cred_err.configure(text='')
+                        self._set_cred_info(f"Client: {name}\nExpiry: {exp}\nTOTP:   {code}")
+                        self.btn_gen.configure(state='normal', text='⚡ Generate')
+                    self.after(0, _update)
+                else:
+                    err=str(data)
+                    self.after(0, lambda: [
+                        self.lbl_cred_err.configure(text=f"Failed: {err[:80]}"),
+                        self.lbl_cred_status.configure(text='', text_color=MUTED),
+                        self.btn_gen.configure(state='normal', text='⚡ Generate')])
+            except Exception as e:
+                msg=str(e)
+                self.after(0, lambda: [
+                    self.lbl_cred_err.configure(text=f"Error: {msg[:80]}"),
+                    self.lbl_cred_status.configure(text='', text_color=MUTED),
+                    self.btn_gen.configure(state='normal', text='⚡ Generate')])
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _save_creds(self):
+        cid =self.e_cid.get().strip()
+        tok =self.e_tok.get().strip()
+        pin =self.e_pin.get().strip()
+        totp=self.e_totp.get().strip()
+        if not cid:
+            self.lbl_cred_err.configure(text='Client ID required'); return
+        if not tok:
+            self.lbl_cred_err.configure(
+                text='Access Token required — click ⚡ Generate or paste it'); return
+        _save_env(DHAN_CLIENT_ID=cid, DHAN_ACCESS_TOKEN=tok,
+                  DHAN_PIN=pin, DHAN_TOTP_SECRET=totp)
+        _load_dotenv_fallback(str(ENV_PATH))
+        self.lbl_cred_status.configure(
+            text='✅ Saved! Switch to Live Trading to start.', text_color=GREEN)
+        self.lbl_cred_err.configure(text='')
+        self._refresh_token_badge()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  LIVE TRADING PAGE
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_trading_page(self):
+        p=self.page_trading
+
+        # ── instrument table ─────────────────────────────────────────────────
+        tbl_outer=ctk.CTkFrame(p, fg_color=PANEL, corner_radius=8)
+        tbl_outer.pack(fill='x', padx=8, pady=(8,2))
+
+        hdr=ctk.CTkFrame(tbl_outer, fg_color=DARK, corner_radius=0, height=26)
+        hdr.pack(fill='x'); hdr.pack_propagate(False)
         for col in COLS:
-            ctk.CTkLabel(hdr, text=COL_LABELS[col], width=COL_W[col],
-                anchor="e" if col not in ('name','pos','note','trend') else "w",
-                font=ctk.CTkFont(MONO, 9, "bold"),
-                text_color=MUTED).pack(side="left", padx=2)
+            anch='w' if col in ('name','pos','note','trend') else 'e'
+            ctk.CTkLabel(hdr, text=COL_HDR[col], width=COL_W[col], anchor=anch,
+                font=ctk.CTkFont(MONO,9,'bold'), text_color=MUTED).pack(side='left', padx=2)
 
-        # Scrollable rows area
-        self.table_scroll = ctk.CTkScrollableFrame(
-            outer, fg_color="transparent", corner_radius=0, height=300)
-        self.table_scroll.pack(fill="x")
-        self.table_container = self.table_scroll
+        self.table_scroll=ctk.CTkScrollableFrame(
+            tbl_outer, fg_color='transparent', corner_radius=0, height=280)
+        self.table_scroll.pack(fill='x')
 
-    def _build_rows(self, selected: list):
-        for w in self.table_container.winfo_children():
-            w.destroy()
+        # ── bottom split ──────────────────────────────────────────────────────
+        bot=ctk.CTkFrame(p, fg_color='transparent')
+        bot.pack(fill='both', expand=True, padx=8, pady=4)
+
+        # trade log (left)
+        log_frm=ctk.CTkFrame(bot, fg_color=PANEL, corner_radius=8)
+        log_frm.pack(side='left', fill='both', expand=True, padx=(0,4))
+        ctk.CTkLabel(log_frm, text='Trade Log — All Instruments',
+            font=ctk.CTkFont(MONO,11,'bold'), text_color=ACCENT, anchor='w').pack(
+            fill='x', padx=10, pady=(6,2))
+        self.log_box=ctk.CTkTextbox(log_frm, fg_color=DARK, border_color=BORDER,
+            font=ctk.CTkFont(MONO,11), text_color=WHITE, state='disabled')
+        self.log_box.pack(fill='both', expand=True, padx=8, pady=(0,8))
+
+        # forming candles (right)
+        fc_frm=ctk.CTkFrame(bot, fg_color=PANEL, corner_radius=8, width=500)
+        fc_frm.pack(side='right', fill='y', padx=(4,0))
+        fc_frm.pack_propagate(False)
+        ctk.CTkLabel(fc_frm, text='Forming 3m Candles',
+            font=ctk.CTkFont(MONO,11,'bold'), text_color=ACCENT, anchor='w').pack(
+            fill='x', padx=10, pady=(6,2))
+        self.forming_box=ctk.CTkTextbox(fc_frm, fg_color=DARK, border_color=BORDER,
+            font=ctk.CTkFont(MONO,11), text_color=WHITE, state='disabled')
+        self.forming_box.pack(fill='both', expand=True, padx=8, pady=(0,8))
+
+    def _build_rows(self, selected):
+        for w in self.table_scroll.winfo_children(): w.destroy()
         self._rows.clear()
         for i, inst in enumerate(selected):
-            row = DashboardRow(self.table_container, inst, i)
-            self._rows[_engine_key(inst['security_id'], inst['exchange'])] = row
-
-    # ── bottom panels ─────────────────────────────────────────────────────────
-    def _build_bottom(self):
-        bot = ctk.CTkFrame(self, fg_color="transparent")
-        bot.pack(fill="both", expand=True, padx=8, pady=4)
-
-        self.trade_log  = TradeLogPanel(bot)
-        self.trade_log.pack(side="left", fill="both", expand=True, padx=(0,4))
-
-        self.forming_panel = FormingCandlesPanel(bot)
-        self.forming_panel.pack(side="right", fill="y", padx=(4,0), pady=0)
+            row=DashboardRow(self.table_scroll, inst, i)
+            self._rows[_engine_key(inst['security_id'], inst['exchange'])]=row
 
     # ── status bar ────────────────────────────────────────────────────────────
     def _build_statusbar(self):
-        bar = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=28)
-        bar.pack(fill="x", side="bottom")
-        bar.pack_propagate(False)
-        self.lbl_ws    = ctk.CTkLabel(bar, text="● WS: offline",
+        bar=ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=28)
+        bar.pack(fill='x', side='bottom'); bar.pack_propagate(False)
+        self.lbl_ws=ctk.CTkLabel(bar, text='● WS: offline',
             font=ctk.CTkFont(MONO,11), text_color=RED)
-        self.lbl_ws.pack(side="left", padx=12, pady=4)
-        self.lbl_pkts  = ctk.CTkLabel(bar, text="Packets T/P/O/D: 0/0/0/0",
+        self.lbl_ws.pack(side='left', padx=12, pady=4)
+        self.lbl_pkts=ctk.CTkLabel(bar, text='Packets T/P/O/D: 0/0/0/0',
             font=ctk.CTkFont(MONO,11), text_color=MUTED)
-        self.lbl_pkts.pack(side="left", padx=12)
-        self.lbl_err   = ctk.CTkLabel(bar, text="",
+        self.lbl_pkts.pack(side='left', padx=12)
+        self.lbl_err=ctk.CTkLabel(bar, text='',
             font=ctk.CTkFont(MONO,11), text_color=RED)
-        self.lbl_err.pack(side="left", padx=8)
-        self.lbl_phase = ctk.CTkLabel(bar, text="",
+        self.lbl_err.pack(side='left', padx=8)
+        self.lbl_phase=ctk.CTkLabel(bar, text='',
             font=ctk.CTkFont(MONO,11), text_color=YELLOW)
-        self.lbl_phase.pack(side="right", padx=12)
-
-    # ── credentials ───────────────────────────────────────────────────────────
-    def _open_creds(self):
-        CredentialsDialog(self, lambda: None)
+        self.lbl_phase.pack(side='right', padx=12)
 
     # ── start / stop ──────────────────────────────────────────────────────────
     def _toggle(self):
@@ -2003,16 +1916,16 @@ class MainWindow(ctk.CTk):
 
     def _start(self):
         if not _creds_ok():
-            CredentialsDialog(self, lambda: None)
-            mb.showinfo("Credentials needed",
-                "Please generate/save your token then click START again.")
+            self._show_page('credentials')
+            self.lbl_cred_err.configure(
+                text='Generate or paste your Access Token first, then Save.')
             return
-        mode = self.mode_var.get().strip().upper()
-        os.environ['TRADE_MODE'] = mode
+        mode=self.mode_var.get().strip().upper()
+        os.environ['TRADE_MODE']=mode
         _save_env(TRADE_MODE=mode)
-        self.btn_start.configure(text="⏳ Starting…", state="disabled",
+        self.btn_start.configure(text='⏳ Starting…', state='disabled',
             fg_color=YELLOW, text_color=BG)
-        self.lbl_err.configure(text="")
+        self.lbl_err.configure(text='')
         self.update()
 
         def _init():
@@ -2021,89 +1934,97 @@ class MainWindow(ctk.CTk):
                 global DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, WS_URL
                 DHAN_CLIENT_ID    = os.getenv('DHAN_CLIENT_ID','').strip()
                 DHAN_ACCESS_TOKEN = os.getenv('DHAN_ACCESS_TOKEN','').strip()
-                WS_URL = (f"wss://api-feed.dhan.co?version=2"
-                          f"&token={DHAN_ACCESS_TOKEN}"
-                          f"&clientId={DHAN_CLIENT_ID}&authType=2")
-                app = App()
+                WS_URL=(f"wss://api-feed.dhan.co?version=2"
+                        f"&token={DHAN_ACCESS_TOKEN}"
+                        f"&clientId={DHAN_CLIENT_ID}&authType=2")
+                app=App()
                 app.bootstrap()
-                self._app     = app
-                self._running = True
+                self._app=app; self._running=True
                 self.after(0, lambda: self._build_rows(app.selected))
+                self.after(0, lambda: self._show_page('trading'))
                 self.after(0, lambda: self.btn_start.configure(
-                    text="◼  STOP", state="normal",
+                    text='◼  STOP', state='normal',
                     fg_color=RED, text_color=WHITE))
-                t = threading.Thread(target=app.run_ws_loop, daemon=True)
-                t.start(); app.ws_thread = t
+                t=threading.Thread(target=app.run_ws_loop, daemon=True)
+                t.start(); app.ws_thread=t
             except Exception as e:
-                msg = str(e)
-                self._running = False
+                msg=str(e)
+                self._running=False
                 self.after(0, lambda: [
-                    self.btn_start.configure(text="▶  START", state="normal",
+                    self.btn_start.configure(text='▶  START', state='normal',
                         fg_color=GREEN, text_color=BG),
                     self.lbl_err.configure(text=f"Error: {msg[:100]}")])
-
         threading.Thread(target=_init, daemon=True).start()
 
     def _stop(self):
-        if self._app:
-            self._app.stop(); self._app = None
-        self._running = False
-        self.btn_start.configure(text="▶  START",
-            fg_color=GREEN, text_color=BG, state="normal")
-        self.lbl_ws.configure(text="● WS: offline", text_color=RED)
+        if self._app: self._app.stop(); self._app=None
+        self._running=False
+        self.btn_start.configure(text='▶  START',
+            fg_color=GREEN, text_color=BG, state='normal')
+        self.lbl_ws.configure(text='● WS: offline', text_color=RED)
 
-    # ── tick ─────────────────────────────────────────────────────────────────
+    # ── 1-second tick ─────────────────────────────────────────────────────────
     def _tick(self):
         try:
             self.lbl_clock.configure(
-                text=now_local().strftime("%Y-%m-%d  %H:%M:%S"))
+                text=now_local().strftime('%Y-%m-%d  %H:%M:%S'))
 
             if self._app and self._running:
                 with self._app.stats_lock:
-                    pc  = dict(self._app.packet_counts)
-                    err = self._app.last_ws_error
-                    ct  = self._app.last_ws_connect_time
-
+                    pc=dict(self._app.packet_counts)
+                    err=self._app.last_ws_error
+                    ct=self._app.last_ws_connect_time
                 self.lbl_ws.configure(
-                    text=f"● WS: online  {int(time.time()-ct)}s" if ct else "● WS: connecting…",
+                    text=f"● WS: online  {int(time.time()-ct)}s" if ct else '● WS: connecting…',
                     text_color=GREEN if ct else YELLOW)
                 self.lbl_pkts.configure(
                     text=f"Packets T/P/O/D: {pc['ticker']}/{pc['prev_close']}/{pc['other']}/{pc['disconnect']}")
-                self.lbl_err.configure(text=f"WS: {err}" if err else "")
+                self.lbl_err.configure(text=f"WS: {err}" if err else '')
+                phase_map={'PREOPEN':'Pre-open','ORB_WAIT':'ORB window (09:18–09:24)',
+                           'PRE10':'Pre-10 ORB mode','POST10':'Post-10 ST mode',
+                           'POSTMARKET':'Market closed'}
+                self.lbl_phase.configure(text=phase_map.get(current_market_phase(),''))
 
-                phase_map = {
-                    'PREOPEN':'Pre-open','ORB_WAIT':'ORB window (09:18–09:24)',
-                    'PRE10':'Pre-10 ORB mode','POST10':'Post-10 ST mode',
-                    'POSTMARKET':'Market closed',
-                }
-                self.lbl_phase.configure(
-                    text=phase_map.get(current_market_phase(),''))
-
-                # option subscriptions + fallback poll
                 self._app.process_option_subscriptions()
-                now_ts = time.time()
-                snaps  = []
+                now_ts=time.time(); snaps=[]
                 for inst in self._app.selected:
-                    key = _engine_key(inst['security_id'], inst['exchange'])
-                    eng = self._app.engines.get(key)
+                    key=_engine_key(inst['security_id'], inst['exchange'])
+                    eng=self._app.engines.get(key)
                     if eng is None: continue
                     with eng.lock:
-                        wc  = eng.last_option_tick_wc
-                        has = eng.position is not None
-                    if has and (now_ts - wc) > 5.0:
-                        eng.poll_option_prices()
-                    snap = eng.snapshot()
-                    snaps.append(snap)
-                    row = self._rows.get(key)
+                        wc=eng.last_option_tick_wc; has=eng.position is not None
+                    if has and (now_ts-wc)>5.0: eng.poll_option_prices()
+                    snap=eng.snapshot(); snaps.append(snap)
+                    row=self._rows.get(key)
                     if row: row.update(snap)
 
-                self.trade_log.update_all(snaps)
-                self.forming_panel.update_all(snaps)
-            else:
-                self.lbl_ws.configure(text="● WS: offline", text_color=RED)
+                # trade log
+                lines=[]
+                for s in snaps:
+                    nm=s['instrument']['name']
+                    for r in s['trade_log'][:5]: lines.append(f"[{nm}]  {r}")
+                lines.sort(reverse=True)
+                self.log_box.configure(state='normal')
+                self.log_box.delete('1.0','end')
+                self.log_box.insert('end', '\n'.join(lines) if lines else 'No trades yet.')
+                self.log_box.configure(state='disabled')
 
-        except Exception:
-            pass
+                # forming candles
+                fc_lines=[]
+                for s in snaps:
+                    nm=s['instrument']['name']; c3=s['current_3m']; nxt=s.get('next_eval') or '—'
+                    if c3:
+                        t=epoch_to_local_str(c3['bucket'],False)
+                        fc_lines.append(f"{nm:<18} [{t}] O:{c3['open']:.1f} H:{c3['high']:.1f} L:{c3['low']:.1f} C:{c3['close']:.1f} {c3.get('parts',0)}/3  next:{nxt}")
+                    else:
+                        fc_lines.append(f"{nm:<18} awaiting…  next:{nxt}")
+                self.forming_box.configure(state='normal')
+                self.forming_box.delete('1.0','end')
+                self.forming_box.insert('end', '\n'.join(fc_lines) if fc_lines else '—')
+                self.forming_box.configure(state='disabled')
+            else:
+                self.lbl_ws.configure(text='● WS: offline', text_color=RED)
+        except Exception: pass
         self.after(1000, self._tick)
 
     def _on_close(self):
@@ -2114,34 +2035,25 @@ class MainWindow(ctk.CTk):
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    if getattr(sys, 'frozen', False):
-        _log = Path(sys.executable).parent / 'dhan_orb_crash.log'
+    if getattr(sys,'frozen',False):
+        _log=Path(sys.executable).parent/'dhan_orb_crash.log'
     else:
-        _log = Path(__file__).parent / 'dhan_orb_crash.log'
-
+        _log=Path(__file__).parent/'dhan_orb_crash.log'
     try:
         _load_dotenv_fallback(str(ENV_PATH))
-        if not ENV_PATH.exists():
-            root = tk.Tk(); root.withdraw()
-            mb.showinfo("Welcome", 
-                "No .env file found.\n\nEnter your Dhan credentials on the next screen.")
-            root.destroy()
-        win = MainWindow()
-        if not _creds_ok():
-            win.after(400, win._open_creds)
+        win=MainWindow()
         win.mainloop()
     except Exception as _e:
         import traceback as _tb
-        crash = _tb.format_exc()
+        crash=_tb.format_exc()
         try: _log.write_text(crash, encoding='utf-8')
         except Exception: pass
         try:
-            _r = tk.Tk(); _r.withdraw()
-            mb.showerror("Crash", f"{_e}\n\nSee: {_log}")
-            _r.destroy()
+            _r=tk.Tk(); _r.withdraw()
+            mb.showerror('Crash', f"{_e}\n\nSee: {_log}"); _r.destroy()
         except Exception: pass
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__=='__main__':
     main()
