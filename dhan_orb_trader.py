@@ -366,8 +366,12 @@ def bucket_3m_epoch(epoch_sec: int) -> int:
     return epoch_sec - (epoch_sec % 180)
 
 
-def is_market_time(dt: datetime) -> bool:
+def is_market_time(dt: datetime, exchange: str = 'NSE_EQ') -> bool:
     hm = dt.hour * 60 + dt.minute
+    if exchange == 'MCX_COMM':
+        # MCX commodity market: 09:00 – 23:30 IST
+        return 9 * 60 <= hm <= 23 * 60 + 30
+    # NSE/BSE equity + F&O: 09:15 – 15:30 IST
     return 9 * 60 + 15 <= hm <= 15 * 60 + 30
 
 
@@ -375,9 +379,17 @@ def now_local() -> datetime:
     return datetime.now().astimezone()
 
 
-def current_market_phase() -> str:
+def current_market_phase(exchange: str = 'NSE_EQ') -> str:
     dt = now_local()
     hm = dt.hour * 60 + dt.minute
+    if exchange == 'MCX_COMM':
+        # MCX commodity market: 09:00 – 23:30 IST
+        if hm < 9 * 60:
+            return 'PREOPEN'
+        if hm <= 23 * 60 + 30:
+            return 'POST10'   # MCX has no ORB concept — goes straight to POST10 logic
+        return 'POSTMARKET'
+    # NSE/BSE equity + F&O: 09:15 – 15:30 IST
     if hm < 9 * 60 + 15:
         return 'PREOPEN'
     if hm < 9 * 60 + 24:
@@ -931,7 +943,7 @@ class IndexPaperEngine:
         dt = epoch_to_local_dt(bucket)
         o = float(bar['open']); h = float(bar['high']); l = float(bar['low']); c = float(bar['close'])
 
-        if not is_market_time(dt):
+        if not is_market_time(dt, self.instrument.get('exchange', 'NSE_EQ')):
             self.completed_3m.append({'bucket': bucket, 'open': o, 'high': h, 'low': l, 'close': c})
             self.st.update(o, h, l, c)
             return
@@ -1203,9 +1215,11 @@ class IndexPaperEngine:
         try:
             if phase == 'POSTMARKET':
                 return None
-            # Before market open: next evaluation is market open time
+            # Before market open: next evaluation depends on exchange
             if phase == 'PREOPEN':
-                dt = now_local().replace(hour=9, minute=15, second=0, microsecond=0)
+                exch = self.instrument.get('exchange', 'NSE_EQ')
+                open_h, open_m = (9, 0) if exch == 'MCX_COMM' else (9, 15)
+                dt = now_local().replace(hour=open_h, minute=open_m, second=0, microsecond=0)
                 return dt.strftime('%H:%M')
             # If we have a forming 3m candle, next evaluation is at its end
             if self.current_3m and 'bucket' in self.current_3m:
@@ -1234,7 +1248,7 @@ class IndexPaperEngine:
                 unreal_rupees = unreal * qty
             orb_h, orb_l, orb_ready = self._effective_orb_state_locked()
             note = self.last_strategy_note
-            phase = current_market_phase()
+            phase = current_market_phase(self.instrument.get('exchange', 'NSE_EQ'))
             next_eval = self._next_eval_time_locked(phase)
             if phase == 'PREOPEN':
                 note = 'waiting for market to open'
