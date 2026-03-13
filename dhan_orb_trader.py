@@ -193,12 +193,12 @@ INSTRUMENTS = {
     },
     'CRUDEOILM': {
         # MCX Mini Crude Oil futures — security_id resolved at runtime from scrip master
-        # exchange=MCX_COM for LTP feed; fno_exchange=MCX_COM for options
-        'key': 'CRUDEOILM', 'name': 'CRUDE OIL MINI', 'nse_symbol': 'CRUDEOILM',
-        'exchange': 'MCX_COM', 'security_id': '0',
+        # Correct exchange segment string for MCX is 'MCX_COMM' (double M)
+        'key': 'CRUDEOILM', 'name': 'CRUDE OIL MINI', 'mcx_symbol': 'CRUDEOILM',
+        'exchange': 'MCX_COMM', 'security_id': '0',
         'instrument_type': 'FUTCOM',
         'display_prec': 2, 'strike_step': 100, 'option_prefix': 'CRUDEOILM',
-        'fno_exchange': 'MCX_COM',
+        'fno_exchange': 'MCX_COMM',
         'default_lot_size': int(os.getenv('CRUDEOILM_LOT_SIZE', '10')),
         'lots': int(os.getenv('CRUDEOILM_LOTS', '1')),
     },
@@ -307,14 +307,16 @@ TRADE_MODE_GROUPS['ALL'] = TRADE_MODE_GROUPS['ALL_INDEX'] + TRADE_MODE_GROUPS['A
 
 
 # Dhan WebSocket exchange segment byte → exchange string mapping
+# Source: Dhan market_data reference + official docs
 _EXCH_SEG_MAP: Dict[int, str] = {
-    0: 'IDX_I',    # Indices
-    1: 'NSE_EQ',   # NSE Cash Equity
-    2: 'NSE_FNO',  # NSE F&O
-    3: 'BSE_EQ',   # BSE Cash Equity
-    4: 'BSE_FNO',  # BSE F&O
-    5: 'NSE_CUR',  # NSE Currency
-    7: 'MCX_COM',  # MCX Commodity
+    0: 'IDX_I',        # Indices
+    1: 'NSE_EQ',       # NSE Cash Equity
+    2: 'NSE_FNO',      # NSE F&O
+    3: 'NSE_CURRENCY', # NSE Currency
+    4: 'BSE_EQ',       # BSE Cash Equity
+    5: 'MCX_COMM',     # MCX Commodity  ← correct string is MCX_COMM (double M)
+    7: 'BSE_CURRENCY', # BSE Currency
+    8: 'BSE_FNO',      # BSE F&O
 }
 
 def _engine_key(security_id: str, exchange: str) -> str:
@@ -466,32 +468,55 @@ def resolve_stock_security_ids_from_master() -> None:
             return
         lines = r.text.splitlines()
         reader = csv.DictReader(lines)
-        # Build symbol→secid map for NSE equity rows (EXCH_ID=NSE, SEGMENT=E, INSTRUMENT=EQUITY)
-        # Symbol is in UNDERLYING_SYMBOL column (short trading code e.g. RELIANCE, DIXON)
-        sym_map: Dict[str, str] = {}
+        # Build two maps:
+        # 1. NSE equity: EXCH_ID=NSE, SEGMENT=E, INSTRUMENT=EQUITY → keyed by UNDERLYING_SYMBOL
+        # 2. MCX futures: EXCH_ID=MCX, INSTRUMENT=FUTCOM → keyed by UNDERLYING_SYMBOL
+        #    MCX near-month contract is the one with earliest expiry (EXPIRY_FLAG=Y or lowest date)
+        eq_map:  Dict[str, str] = {}  # symbol → security_id  (NSE equity)
+        mcx_map: Dict[str, tuple] = {}  # symbol → (security_id, expiry_date, contract_display)
         for row in reader:
-            if (row.get('EXCH_ID','').strip().upper() != 'NSE'
-                    or row.get('SEGMENT','').strip().upper() != 'E'
-                    or row.get('INSTRUMENT','').strip().upper() != 'EQUITY'):
+            exch  = row.get('EXCH_ID','').strip().upper()
+            seg   = row.get('SEGMENT','').strip().upper()
+            instr = row.get('INSTRUMENT','').strip().upper()
+            sym   = str(row.get('UNDERLYING_SYMBOL') or '').strip().upper()
+            sid   = str(row.get('SECURITY_ID') or '').strip()
+            if not sym or not sid or sid == '0':
                 continue
-            sym = str(row.get('UNDERLYING_SYMBOL') or '').strip().upper()
-            sid = str(row.get('SECURITY_ID') or '').strip()
-            if sym and sid and sid != '0':
-                sym_map[sym] = sid
+            # NSE equity
+            if exch == 'NSE' and seg == 'E' and instr == 'EQUITY':
+                eq_map[sym] = sid
+            # MCX futures — keep near-month (earliest expiry)
+            if exch == 'MCX' and instr == 'FUTCOM':
+                exp = str(row.get('SM_EXPIRY_DATE') or '').strip()
+                sym_name = str(row.get('SYMBOL_NAME') or '').strip()
+                existing = mcx_map.get(sym)
+                if not existing or (exp and exp < existing[1]):
+                    mcx_map[sym] = (sid, exp, sym_name)
+
         resolved = 0
         for key, inst in INSTRUMENTS.items():
-            if inst.get('instrument_type') != 'EQUITY':
-                continue
-            nse_sym = str(inst.get('nse_symbol', '')).strip().upper()
-            if not nse_sym:
-                continue
-            sid = sym_map.get(nse_sym)
-            if sid:
-                inst['security_id'] = sid
-                resolved += 1
-            else:
-                print(f'[SECID] WARNING: could not resolve security_id for {key} ({nse_sym}) — using fallback {inst["security_id"]}')
-        print(f'[SECID] Resolved {resolved} stock security IDs from scrip master.')
+            itype = inst.get('instrument_type','')
+            if itype == 'EQUITY':
+                nse_sym = str(inst.get('nse_symbol', '')).strip().upper()
+                if not nse_sym: continue
+                sid = eq_map.get(nse_sym)
+                if sid:
+                    inst['security_id'] = sid
+                    resolved += 1
+                else:
+                    print(f'[SECID] WARNING: could not resolve {key} ({nse_sym}) — fallback {inst["security_id"]}')
+            elif itype == 'FUTCOM':
+                mcx_sym = str(inst.get('mcx_symbol', inst.get('key',''))).strip().upper()
+                if not mcx_sym: continue
+                tup = mcx_map.get(mcx_sym)
+                if tup:
+                    inst['security_id'] = tup[0]
+                    inst['contract_display'] = f"{mcx_sym} {tup[1]}"
+                    resolved += 1
+                    print(f'[SECID] MCX {key}: security_id={tup[0]} contract={tup[2]} expiry={tup[1]}')
+                else:
+                    print(f'[SECID] WARNING: could not resolve MCX {key} ({mcx_sym}) — fallback {inst["security_id"]}')
+        print(f'[SECID] Resolved {resolved} security IDs from scrip master.')
     except Exception as e:
         print(f'[SECID] Error resolving stock security IDs: {e}')
 
@@ -1306,9 +1331,9 @@ class App:
             valid = list(INSTRUMENTS.keys()) + list(TRADE_MODE_GROUPS.keys())
             raise SystemExit(f'TRADE_MODE={mode!r} is invalid. Valid options: {valid}')
         selected = [INSTRUMENTS[k] for k in keys]
-        # Warn if any stock has security_id still '0' (resolver failed)
+        # Warn if any instrument has security_id still '0' (resolver failed)
         for inst in selected:
-            if inst.get('instrument_type') == 'EQUITY' and str(inst.get('security_id', '0')) == '0':
+            if str(inst.get('security_id', '0')) == '0':
                 print(f"[WARN] {inst['key']}: security_id is 0 — scrip master lookup failed. This instrument will not receive ticks.")
         return selected
 
