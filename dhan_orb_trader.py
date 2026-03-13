@@ -31,12 +31,25 @@ def _load_dotenv_fallback(path: str = '.env') -> None:
         return
 
 
-_load_dotenv_fallback()
+# ── credentials loaded lazily so GUI can show dialog first ──────────────────
+# Do NOT raise SystemExit here — the GUI handles missing credentials gracefully.
+if getattr(sys, 'frozen', False):
+    _BASE_DIR_EARLY = str(__import__('pathlib').Path(sys.executable).parent)
+else:
+    _BASE_DIR_EARLY = str(__import__('pathlib').Path(__file__).parent)
 
-DHAN_CLIENT_ID = os.getenv('DHAN_CLIENT_ID', '').strip()
+_load_dotenv_fallback(_BASE_DIR_EARLY + '/.env')
+_load_dotenv_fallback('.env')
+
+DHAN_CLIENT_ID    = os.getenv('DHAN_CLIENT_ID', '').strip()
 DHAN_ACCESS_TOKEN = os.getenv('DHAN_ACCESS_TOKEN', '').strip()
-if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
-    raise SystemExit('Missing DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN in .env')
+
+# Placeholders keep the rest of the module from crashing at import time.
+# The GUI will replace these before starting the engine.
+if not DHAN_CLIENT_ID:
+    DHAN_CLIENT_ID = '__PLACEHOLDER__'
+if not DHAN_ACCESS_TOKEN:
+    DHAN_ACCESS_TOKEN = '__PLACEHOLDER__'
 
 WS_URL = (
     f"wss://api-feed.dhan.co?version=2"
@@ -2081,30 +2094,52 @@ class MainWindow(ctk.CTk):
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    # suppress module-level crash if creds missing — GUI handles it
-    os.environ.setdefault('DHAN_CLIENT_ID',    '__PLACEHOLDER__')
-    os.environ.setdefault('DHAN_ACCESS_TOKEN', '__PLACEHOLDER__')
+    # resolve log path next to exe
+    if getattr(sys, 'frozen', False):
+        _log_path = Path(sys.executable).parent / 'dhan_orb_crash.log'
+    else:
+        _log_path = Path(__file__).parent / 'dhan_orb_crash.log'
 
-    # load .env
-    _load_dotenv_fallback(str(ENV_PATH))
+    try:
+        # reload .env with correct base dir
+        _load_dotenv_fallback(str(ENV_PATH))
 
-    # first-launch message
-    if not ENV_PATH.exists():
-        root = tk.Tk(); root.withdraw()
-        mb.showinfo("Welcome",
-            "No .env file found.\n\n"
-            "Please enter your Dhan credentials on the next screen.\n\n"
-            "You can get them from:\n"
-            "web.dhan.co → Profile → API Access")
-        root.destroy()
+        # first-launch message
+        if not ENV_PATH.exists():
+            root = tk.Tk(); root.withdraw()
+            mb.showinfo("Welcome — First Launch",
+                "No .env file found.\n\n"
+                "Please enter your Dhan credentials on the next screen.\n\n"
+                "Get them from:\n"
+                "web.dhan.co → Profile → API Access")
+            root.destroy()
 
-    win = MainWindow()
+        win = MainWindow()
 
-    # auto-open credentials if missing
-    if not _creds_ok():
-        win.after(400, win._open_creds)
+        # auto-open credentials dialog if creds are missing
+        if not _creds_ok():
+            win.after(400, win._open_creds)
 
-    win.mainloop()
+        win.mainloop()
+
+    except Exception as _e:
+        import traceback as _tb
+        _crash = _tb.format_exc()
+        # write crash log
+        try:
+            _log_path.write_text(_crash, encoding='utf-8')
+        except Exception:
+            pass
+        # show messagebox if tkinter is available
+        try:
+            _r = tk.Tk(); _r.withdraw()
+            mb.showerror("DhanORBTrader — Crash",
+                f"The application crashed:\n\n{str(_e)}\n\n"
+                f"Full details written to:\n{_log_path}")
+            _r.destroy()
+        except Exception:
+            pass
+        sys.exit(1)
 
 
 if __name__ == '__main__':

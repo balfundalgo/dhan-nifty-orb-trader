@@ -24,6 +24,6 @@ exe = EXE(
     pyz, a.scripts, a.binaries, a.datas, [],
     name='DhanORBTrader',
     debug=False, strip=False, upx=True,
-    console=False,
+    console=True,   # keep console visible so crash messages are readable
     runtime_tmpdir=None,
 )
