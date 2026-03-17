@@ -60,11 +60,13 @@ WS_URL = (
 
 # ---------------- Config ----------------
 # TRADE_MODE options:
-#   Single : NIFTY | BANKNIFTY | SENSEX | DIXON | KAYNES | BAJAJ_AUTO | MARUTI |
-#            EICHERMOT | HEROMOTOCO | BSE | MCX | ADANIENT | LTIM | PERSISTENT |
-#            OFSS | INDIGO | TVSMOTOR | ULTRACEMCO | BRITANNIA | APOLLOHOSP | RELIANCE
-#   Groups : ALL_INDEX  (NIFTY + BANKNIFTY + SENSEX)
-#            ALL_STOCKS (all 18 stocks)
+#   Single : NIFTY | BANKNIFTY | SENSEX | FINNIFTY | MIDCPNIFTY |
+#            DIXON | KAYNES | BAJAJ_AUTO | MARUTI | EICHERMOT | HEROMOTOCO |
+#            BSE | MCX | ADANIENT | LTIM | PERSISTENT | OFSS | INDIGO |
+#            TVSMOTOR | ULTRACEMCO | BRITANNIA | APOLLOHOSP | RELIANCE |
+#            TATAELXSI | POLYCAB
+#   Groups : ALL_INDEX  (NIFTY + BANKNIFTY + SENSEX + FINNIFTY + MIDCPNIFTY)
+#            ALL_STOCKS (all 20 stocks)
 #            COMMODITY  (CRUDEOILM)
 #            ALL        (ALL_INDEX + ALL_STOCKS + COMMODITY)
 TRADE_MODE = os.getenv('TRADE_MODE', 'NIFTY').strip().upper()
@@ -95,7 +97,7 @@ INSTRUMENTS = {
         'instrument_type': 'INDEX',
         'display_prec': 2, 'strike_step': 50, 'option_prefix': 'NIFTY',
         'fno_exchange': 'NSE_FNO',
-        'default_lot_size': int(os.getenv('NIFTY_LOT_SIZE', '75')),
+        'default_lot_size': int(os.getenv('NIFTY_LOT_SIZE', '65')),
         'lots': int(os.getenv('NIFTY_LOTS', '1')),
     },
     'BANKNIFTY': {
@@ -104,7 +106,7 @@ INSTRUMENTS = {
         'instrument_type': 'INDEX',
         'display_prec': 2, 'strike_step': 100, 'option_prefix': 'BANKNIFTY',
         'fno_exchange': 'NSE_FNO',
-        'default_lot_size': int(os.getenv('BANKNIFTY_LOT_SIZE', '35')),
+        'default_lot_size': int(os.getenv('BANKNIFTY_LOT_SIZE', '30')),
         'lots': int(os.getenv('BANKNIFTY_LOTS', '1')),
     },
     'SENSEX': {
@@ -115,6 +117,24 @@ INSTRUMENTS = {
         'fno_exchange': 'BSE_FNO',
         'default_lot_size': int(os.getenv('SENSEX_LOT_SIZE', '20')),
         'lots': int(os.getenv('SENSEX_LOTS', '1')),
+    },
+    'FINNIFTY': {
+        'key': 'FINNIFTY', 'name': 'FINNIFTY',
+        'exchange': 'IDX_I', 'security_id': '27',
+        'instrument_type': 'INDEX',
+        'display_prec': 2, 'strike_step': 50, 'option_prefix': 'FINNIFTY',
+        'fno_exchange': 'NSE_FNO',
+        'default_lot_size': int(os.getenv('FINNIFTY_LOT_SIZE', '60')),
+        'lots': int(os.getenv('FINNIFTY_LOTS', '1')),
+    },
+    'MIDCPNIFTY': {
+        'key': 'MIDCPNIFTY', 'name': 'MIDCAP NIFTY',
+        'exchange': 'IDX_I', 'security_id': '442',
+        'instrument_type': 'INDEX',
+        'display_prec': 2, 'strike_step': 25, 'option_prefix': 'MIDCPNIFTY',
+        'fno_exchange': 'NSE_FNO',
+        'default_lot_size': int(os.getenv('MIDCPNIFTY_LOT_SIZE', '120')),
+        'lots': int(os.getenv('MIDCPNIFTY_LOTS', '1')),
     },
 
     # ── Stocks ───────────────────────────────────────────────────────────────
@@ -294,15 +314,33 @@ INSTRUMENTS = {
         'default_lot_size': int(os.getenv('RELIANCE_LOT_SIZE', '500')),
         'lots': int(os.getenv('RELIANCE_LOTS', '1')),
     },
+    'TATAELXSI': {
+        'key': 'TATAELXSI', 'name': 'TATA ELXSI', 'nse_symbol': 'TATAELXSI',
+        'exchange': 'NSE_EQ', 'security_id': '3411',
+        'instrument_type': 'EQUITY',
+        'display_prec': 2, 'strike_step': 100, 'option_prefix': 'TATAELXSI',
+        'fno_exchange': 'NSE_FNO',
+        'default_lot_size': int(os.getenv('TATAELXSI_LOT_SIZE', '100')),
+        'lots': int(os.getenv('TATAELXSI_LOTS', '1')),
+    },
+    'POLYCAB': {
+        'key': 'POLYCAB', 'name': 'POLYCAB INDIA', 'nse_symbol': 'POLYCAB',
+        'exchange': 'NSE_EQ', 'security_id': '9590',
+        'instrument_type': 'EQUITY',
+        'display_prec': 2, 'strike_step': 100, 'option_prefix': 'POLYCAB',
+        'fno_exchange': 'NSE_FNO',
+        'default_lot_size': int(os.getenv('POLYCAB_LOT_SIZE', '125')),
+        'lots': int(os.getenv('POLYCAB_LOTS', '1')),
+    },
 }
 
 # Instrument groupings for TRADE_MODE
 TRADE_MODE_GROUPS: Dict[str, List[str]] = {
-    'ALL_INDEX':  ['NIFTY', 'BANKNIFTY', 'SENSEX'],
+    'ALL_INDEX':  ['NIFTY', 'BANKNIFTY', 'SENSEX', 'FINNIFTY', 'MIDCPNIFTY'],
     'ALL_STOCKS': ['DIXON', 'KAYNES', 'BAJAJ_AUTO', 'MARUTI', 'EICHERMOT',
                    'HEROMOTOCO', 'BSE', 'MCX', 'ADANIENT', 'LTIM',
                    'PERSISTENT', 'OFSS', 'INDIGO', 'TVSMOTOR', 'ULTRACEMCO',
-                   'BRITANNIA', 'APOLLOHOSP', 'RELIANCE'],
+                   'BRITANNIA', 'APOLLOHOSP', 'RELIANCE', 'TATAELXSI', 'POLYCAB'],
 }
 TRADE_MODE_GROUPS['COMMODITY'] = ['CRUDEOILM']
 TRADE_MODE_GROUPS['ALL'] = TRADE_MODE_GROUPS['ALL_INDEX'] + TRADE_MODE_GROUPS['ALL_STOCKS'] + TRADE_MODE_GROUPS['COMMODITY']
