@@ -43,6 +43,8 @@ _load_dotenv_fallback('.env')
 
 DHAN_CLIENT_ID    = os.getenv('DHAN_CLIENT_ID', '').strip()
 DHAN_ACCESS_TOKEN = os.getenv('DHAN_ACCESS_TOKEN', '').strip()
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 
 # Placeholders keep the rest of the module from crashing at import time.
 # The GUI will replace these before starting the engine.
@@ -653,6 +655,97 @@ def fetch_intraday_1m_history(security_id: str, exchange_segment: str, lookback_
     return out
 
 
+# ---------------- telegram alerts ----------------
+import queue as _queue
+
+class TelegramAlerter:
+    """Non-blocking Telegram alert sender.
+    Uses a background thread + queue so trade execution is never delayed
+    by network latency. If Telegram is not configured, silently does nothing.
+    """
+    _SEND_URL = 'https://api.telegram.org/bot{token}/sendMessage'
+
+    def __init__(self, bot_token: str, chat_id: str):
+        self._token   = bot_token.strip()
+        self._chat_id = chat_id.strip()
+        self._enabled = bool(self._token and self._chat_id)
+        self._q: '_queue.Queue[str]' = _queue.Queue(maxsize=100)
+        if self._enabled:
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+
+    def _worker(self):
+        while True:
+            text = self._q.get()
+            try:
+                requests.post(
+                    self._SEND_URL.format(token=self._token),
+                    json={'chat_id': self._chat_id,
+                          'text': text,
+                          'parse_mode': 'HTML'},
+                    timeout=10,
+                )
+            except Exception:
+                pass  # never crash the trading engine due to Telegram issues
+            self._q.task_done()
+
+    def send(self, text: str):
+        if not self._enabled:
+            return
+        try:
+            self._q.put_nowait(text)
+        except _queue.Full:
+            pass  # drop if queue is full (shouldn't happen in normal use)
+
+    def send_entry(self, inst_name: str, side: str, strike: int,
+                   index_price: float, option_price: float,
+                   qty: int, expiry: str, reason: str, time_str: str):
+        emoji = '🟢' if side == 'CE' else '🔴'
+        side_word = 'CALL (CE)' if side == 'CE' else 'PUT (PE)'
+        self.send(
+            f"{emoji} <b>ENTER — {inst_name}</b>\n"
+            f"📋 {side_word}  Strike: <b>{strike}</b>\n"
+            f"📈 Index: <b>{index_price:,.2f}</b>\n"
+            f"💰 Premium: <b>₹{option_price:.2f}</b>  |  Qty: {qty}\n"
+            f"📅 Expiry: {expiry}\n"
+            f"⏰ {time_str}  |  {reason}"
+        )
+
+    def send_exit(self, inst_name: str, side: str, strike: int,
+                  index_price: float, option_price: float,
+                  pnl_prem: float, pnl_rupees: float,
+                  qty: int, reason: str, time_str: str):
+        pnl_emoji = '✅' if pnl_rupees >= 0 else '🛑'
+        sgn = '+' if pnl_rupees >= 0 else ''
+        reason_upper = reason.upper()
+        if 'SL' in reason_upper or 'STOP' in reason_upper or 'ORB' in reason_upper and 'SL' in reason_upper:
+            action_emoji = '🛑 SL HIT'
+        elif 'REVERSE' in reason_upper:
+            action_emoji = '🔄 REVERSE'
+        else:
+            action_emoji = '🏁 EXIT'
+        self.send(
+            f"{pnl_emoji} <b>{action_emoji} — {inst_name}</b>\n"
+            f"📋 {'CALL (CE)' if side == 'CE' else 'PUT (PE)'}  Strike: <b>{strike}</b>\n"
+            f"📉 Index: <b>{index_price:,.2f}</b>\n"
+            f"💸 Exit Prem: <b>₹{option_price:.2f}</b>  |  Qty: {qty}\n"
+            f"{'💚' if pnl_rupees >= 0 else '❤️'} P&L: <b>{sgn}₹{pnl_rupees:,.2f}</b> "
+            f"({sgn}{pnl_prem:.2f} pts)\n"
+            f"📌 Reason: {reason}\n"
+            f"⏰ {time_str}"
+        )
+
+
+# Singleton alerter — initialised once, used by all engines
+_tg_alerter: Optional['TelegramAlerter'] = None
+
+def _get_alerter() -> 'TelegramAlerter':
+    global _tg_alerter, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    if _tg_alerter is None:
+        _tg_alerter = TelegramAlerter(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    return _tg_alerter
+
+
 # ---------------- supertrend ----------------
 class SupertrendState:
     def __init__(self, atr_len: int, factor: float):
@@ -1101,6 +1194,58 @@ class IndexPaperEngine:
             lot_txt = f'qty {int(self.entry_lot_size) * int(self.entry_lots)}'
         self.trade_log.appendleft(f'{stamp} | {action:<5} | {opt_txt:<26} | idx {price:,.2f} | {prem_txt:<14} | {lot_txt:<8} | {note}')
         self.last_strategy_note = note
+        # Fire Telegram alert (non-blocking)
+        self._send_telegram_alert(action, side, strike, price, bucket, note)
+
+    def _send_telegram_alert(self, action: str, side: str, strike: Optional[int],
+                              price: float, bucket: int, note: str):
+        """Called from _log_trade_locked — fires Telegram alert for ENTER/EXIT."""
+        try:
+            alerter = _get_alerter()
+            if not alerter._enabled:
+                return
+            inst_name = self.instrument.get('name', self.instrument.get('key', '?'))
+            time_str  = epoch_to_local_str(bucket, with_seconds=False)
+            qty = int((self.entry_lot_size or 1) * max(1, int(self.entry_lots)))
+            if action == 'ENTER':
+                alerter.send_entry(
+                    inst_name   = inst_name,
+                    side        = side,
+                    strike      = strike or 0,
+                    index_price = price,
+                    option_price= self.entry_option_price or 0.0,
+                    qty         = qty,
+                    expiry      = self.entry_expiry or '—',
+                    reason      = note,
+                    time_str    = time_str,
+                )
+            elif action == 'EXIT':
+                # Parse pnl from note: format "reason | pnl=X.XX prem | ₹Y.YY"
+                pnl_prem  = 0.0
+                pnl_rupees = 0.0
+                try:
+                    if 'pnl=' in note:
+                        pnl_part = note.split('pnl=')[1].split(' ')[0]
+                        pnl_prem = float(pnl_part)
+                    if '₹' in note:
+                        rp_part = note.split('₹')[1].split('|')[0].strip()
+                        pnl_rupees = float(rp_part)
+                except Exception:
+                    pass
+                alerter.send_exit(
+                    inst_name   = inst_name,
+                    side        = side,
+                    strike      = strike or 0,
+                    index_price = price,
+                    option_price= self.current_option_price or 0.0,
+                    pnl_prem    = pnl_prem,
+                    pnl_rupees  = pnl_rupees,
+                    qty         = qty,
+                    reason      = note.split(' | ')[0],   # just the reason part
+                    time_str    = time_str,
+                )
+        except Exception:
+            pass  # never let Telegram code crash the engine
 
     def _exit_locked(self, price: float, bucket: int, reason: str):
         if self.position is None or self.entry_price is None:
@@ -1787,6 +1932,44 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(MONO,10), text_color=MUTED, state='disabled')
         self.cred_info.pack(pady=(8,0))
 
+        # Telegram section
+        ctk.CTkLabel(p, text='── Telegram Alerts (optional) ──',
+            font=ctk.CTkFont(MONO,11), text_color=MUTED).pack(pady=(14,4))
+
+        tg_frm=ctk.CTkFrame(p, fg_color=PANEL, corner_radius=12, width=540)
+        tg_frm.pack()
+        tg_frm.pack_propagate(False)
+
+        def _tg_row(label, env_key, show='', w=320):
+            r=ctk.CTkFrame(tg_frm, fg_color='transparent')
+            r.pack(fill='x', padx=20, pady=6)
+            ctk.CTkLabel(r, text=label, width=160, anchor='w',
+                font=ctk.CTkFont(MONO,12), text_color=MUTED).pack(side='left')
+            e=ctk.CTkEntry(r, show=show, width=w,
+                font=ctk.CTkFont(MONO,12),
+                fg_color=DARK, border_color=BORDER, text_color=WHITE)
+            val=os.getenv(env_key,'')
+            if val: e.insert(0,val)
+            e.pack(side='left')
+            return e
+
+        self.e_tg_token = _tg_row('Bot Token',  'TELEGRAM_BOT_TOKEN', '•')
+        self.e_tg_chat  = _tg_row('Chat ID',    'TELEGRAM_CHAT_ID')
+
+        ctk.CTkLabel(p,
+            text='Get token: @BotFather → /newbot    |    Get Chat ID: message bot then check api.telegram.org/bot<TOKEN>/getUpdates',
+            font=ctk.CTkFont(MONO,9), text_color=MUTED).pack(pady=(4,0))
+
+        self.btn_tg_test = ctk.CTkButton(p, text='📨 Send Test Alert', width=180,
+            font=ctk.CTkFont(MONO,11,'bold'),
+            fg_color=BORDER, hover_color=DARK, text_color=WHITE,
+            command=self._test_telegram)
+        self.btn_tg_test.pack(pady=(8,0))
+
+        self.lbl_tg_status = ctk.CTkLabel(p, text='',
+            font=ctk.CTkFont(MONO,11), text_color=MUTED)
+        self.lbl_tg_status.pack(pady=(4,0))
+
         # Save button
         ctk.CTkButton(p, text='💾  Save Credentials', height=40, width=240,
             font=ctk.CTkFont(MONO,13,'bold'),
@@ -1860,18 +2043,60 @@ class MainWindow(ctk.CTk):
                     self.btn_gen.configure(state='normal', text='⚡ Generate')])
         threading.Thread(target=_do, daemon=True).start()
 
+    def _test_telegram(self):
+        token = self.e_tg_token.get().strip()
+        chat  = self.e_tg_chat.get().strip()
+        if not token or not chat:
+            self.lbl_tg_status.configure(
+                text='Enter Bot Token and Chat ID first', text_color=YELLOW); return
+        self.btn_tg_test.configure(state='disabled', text='Sending…')
+        def _do():
+            try:
+                r = requests.post(
+                    f'https://api.telegram.org/bot{token}/sendMessage',
+                    json={'chat_id': chat,
+                          'text': '✅ <b>Dhan ORB Trader</b>\n\nTelegram alerts are working!\n🟢 ENTER — NIFTY CE 24200 @ ₹84.00\n(This is a test message)',
+                          'parse_mode': 'HTML'},
+                    timeout=10)
+                data = r.json()
+                if data.get('ok'):
+                    self.after(0, lambda: [
+                        self.lbl_tg_status.configure(text='✅ Test message sent!', text_color=GREEN),
+                        self.btn_tg_test.configure(state='normal', text='📨 Send Test Alert')])
+                else:
+                    err = data.get('description','Unknown error')
+                    self.after(0, lambda: [
+                        self.lbl_tg_status.configure(text=f'❌ {err}', text_color=RED),
+                        self.btn_tg_test.configure(state='normal', text='📨 Send Test Alert')])
+            except Exception as e:
+                msg=str(e)
+                self.after(0, lambda: [
+                    self.lbl_tg_status.configure(text=f'❌ {msg[:60]}', text_color=RED),
+                    self.btn_tg_test.configure(state='normal', text='📨 Send Test Alert')])
+        threading.Thread(target=_do, daemon=True).start()
+
     def _save_creds(self):
         cid =self.e_cid.get().strip()
         tok =self.e_tok.get().strip()
         pin =self.e_pin.get().strip()
         totp=self.e_totp.get().strip()
+        tg_token = self.e_tg_token.get().strip()
+        tg_chat  = self.e_tg_chat.get().strip()
         if not cid:
             self.lbl_cred_err.configure(text='Client ID required'); return
         if not tok:
             self.lbl_cred_err.configure(
                 text='Access Token required — click ⚡ Generate or paste it'); return
-        _save_env(DHAN_CLIENT_ID=cid, DHAN_ACCESS_TOKEN=tok,
+        kw = dict(DHAN_CLIENT_ID=cid, DHAN_ACCESS_TOKEN=tok,
                   DHAN_PIN=pin, DHAN_TOTP_SECRET=totp)
+        if tg_token: kw['TELEGRAM_BOT_TOKEN'] = tg_token
+        if tg_chat:  kw['TELEGRAM_CHAT_ID']   = tg_chat
+        _save_env(**kw)
+        # Refresh global Telegram alerter with new credentials
+        global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, _tg_alerter
+        TELEGRAM_BOT_TOKEN = tg_token
+        TELEGRAM_CHAT_ID   = tg_chat
+        _tg_alerter = None  # reset so it's rebuilt with new creds on next alert
         _load_dotenv_fallback(str(ENV_PATH))
         self.lbl_cred_status.configure(
             text='✅ Saved! Switch to Live Trading to start.', text_color=GREEN)
