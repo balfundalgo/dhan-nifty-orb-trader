@@ -1603,14 +1603,34 @@ class App:
         with self.stats_lock:
             self.last_ws_connect_time = int(time.time())
             self.last_ws_error = None
-            self.last_ws_error = None
+
+        # Reset subscribed_secids on every (re)connect so option contracts
+        # get resubscribed — WS reconnect silently drops all option subscriptions.
+        self.subscribed_secids = set(
+            _engine_key(str(inst['security_id']), inst['exchange'])
+            for inst in self.selected
+        )
+
+        # Underlying instruments + any live option positions
+        instrument_list = [
+            {'ExchangeSegment': inst['exchange'], 'SecurityId': str(inst['security_id'])}
+            for inst in self.selected
+        ]
+        for inst in self.selected:
+            eng = self.engines.get(_engine_key(inst['security_id'], inst['exchange']))
+            if eng is None: continue
+            with eng.lock:
+                sid    = eng.entry_option_security_id
+                fno_ex = inst.get('fno_exchange', 'NSE_FNO')
+                has    = eng.position is not None
+            if has and sid:
+                instrument_list.append({'ExchangeSegment': fno_ex, 'SecurityId': str(sid)})
+                self.subscribed_secids.add(_engine_key(str(sid), fno_ex))
+
         sub = {
             'RequestCode': REQ_SUB_TICKER,
-            'InstrumentCount': len(self.selected),
-            'InstrumentList': [
-                {'ExchangeSegment': inst['exchange'], 'SecurityId': str(inst['security_id'])}
-                for inst in self.selected
-            ],
+            'InstrumentCount': len(instrument_list),
+            'InstrumentList': instrument_list,
         }
         ws.send(json.dumps(sub))
 
@@ -2349,10 +2369,24 @@ class MainWindow(ctk.CTk):
                         eng = self._app.engines.get(key)
                         if eng is None: continue
                         with eng.lock:
-                            wc  = eng.last_option_tick_wc
-                            has = eng.position is not None
-                        if has and (now_ts - wc) > 5.0:
-                            eng.poll_option_prices()
+                            wc     = eng.last_option_tick_wc
+                            has    = eng.position is not None
+                            sid    = eng.entry_option_security_id
+                            fno_ex = inst.get('fno_exchange', 'NSE_FNO')
+                        if has:
+                            ws_age = now_ts - wc
+                            if ws_age > 5.0:
+                                eng.poll_option_prices()
+                            # Re-queue WS subscription if ticks dry up >10s
+                            # Recovers from subscription loss on WS reconnect
+                            if ws_age > 10.0 and sid:
+                                self._app.subscribed_secids.discard(
+                                    _engine_key(str(sid), fno_ex))
+                                with eng.lock:
+                                    eng._pending_option_sub_req = {
+                                        'security_id': str(sid),
+                                        'exchange': fno_ex,
+                                    }
             except Exception:
                 pass
             time.sleep(1.0)
