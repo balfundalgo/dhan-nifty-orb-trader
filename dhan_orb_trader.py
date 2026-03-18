@@ -1076,7 +1076,9 @@ class IndexPaperEngine:
 
         if not is_market_time(dt, self.instrument.get('exchange', 'NSE_EQ')):
             self.completed_3m.append({'bucket': bucket, 'open': o, 'high': h, 'low': l, 'close': c})
-            self.st.update(o, h, l, c)
+            # Do NOT feed Supertrend with pre/post-market candles — they pollute
+            # the ATR calculation and cause values to diverge from TradingView.
+            # ST is only updated with candles that fall within market hours.
             return
 
         day_key = dt.strftime('%Y-%m-%d')
@@ -1911,7 +1913,10 @@ class MainWindow(ctk.CTk):
     #  CREDENTIALS PAGE
     # ══════════════════════════════════════════════════════════════════════════
     def _build_creds_page(self):
-        p=self.page_creds
+        # Wrap everything in a scrollable frame so Save button is always reachable
+        scroll = ctk.CTkScrollableFrame(self.page_creds, fg_color=BG, corner_radius=0)
+        scroll.pack(fill='both', expand=True)
+        p = scroll
 
         ctk.CTkLabel(p, text='Dhan API Credentials',
             font=ctk.CTkFont(MONO,18,'bold'), text_color=ACCENT).pack(pady=(32,4))
@@ -2249,6 +2254,9 @@ class MainWindow(ctk.CTk):
                     fg_color=RED, text_color=WHITE))
                 t=threading.Thread(target=app.run_ws_loop, daemon=True)
                 t.start(); app.ws_thread=t
+                # Start background option polling thread (off main tkinter thread)
+                bg=threading.Thread(target=self._start_bg_loop, daemon=True)
+                bg.start()
             except Exception as e:
                 msg=str(e)
                 self._running=False
@@ -2265,7 +2273,28 @@ class MainWindow(ctk.CTk):
             fg_color=GREEN, text_color=BG, state='normal')
         self.lbl_ws.configure(text='● WS: offline', text_color=RED)
 
-    # ── 1-second tick ─────────────────────────────────────────────────────────
+    def _start_bg_loop(self):
+        """Background thread: option subscriptions + fallback polling.
+        Kept off the main tkinter thread so GUI never blocks on network I/O."""
+        while self._running:
+            try:
+                if self._app:
+                    self._app.process_option_subscriptions()
+                    now_ts = time.time()
+                    for inst in self._app.selected:
+                        key = _engine_key(inst['security_id'], inst['exchange'])
+                        eng = self._app.engines.get(key)
+                        if eng is None: continue
+                        with eng.lock:
+                            wc  = eng.last_option_tick_wc
+                            has = eng.position is not None
+                        if has and (now_ts - wc) > 5.0:
+                            eng.poll_option_prices()
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    # ── 1-second GUI tick (pure GUI work — no API calls) ─────────────────────
     def _tick(self):
         try:
             self.lbl_clock.configure(
@@ -2273,60 +2302,68 @@ class MainWindow(ctk.CTk):
 
             if self._app and self._running:
                 with self._app.stats_lock:
-                    pc=dict(self._app.packet_counts)
-                    err=self._app.last_ws_error
-                    ct=self._app.last_ws_connect_time
+                    pc  = dict(self._app.packet_counts)
+                    err = self._app.last_ws_error
+                    ct  = self._app.last_ws_connect_time
+
                 self.lbl_ws.configure(
                     text=f"● WS: online  {int(time.time()-ct)}s" if ct else '● WS: connecting…',
                     text_color=GREEN if ct else YELLOW)
                 self.lbl_pkts.configure(
                     text=f"Packets T/P/O/D: {pc['ticker']}/{pc['prev_close']}/{pc['other']}/{pc['disconnect']}")
                 self.lbl_err.configure(text=f"WS: {err}" if err else '')
-                phase_map={'PREOPEN':'Pre-open','ORB_WAIT':'ORB window (09:18–09:24)',
-                           'PRE10':'Pre-10 ORB mode','POST10':'Post-10 ST mode',
-                           'POSTMARKET':'Market closed'}
+
+                phase_map = {'PREOPEN':'Pre-open','ORB_WAIT':'ORB window (09:18–09:24)',
+                             'PRE10':'Pre-10 ORB mode','POST10':'Post-10 ST mode',
+                             'POSTMARKET':'Market closed'}
                 self.lbl_phase.configure(text=phase_map.get(current_market_phase(),''))
 
-                self._app.process_option_subscriptions()
-                now_ts=time.time(); snaps=[]
+                # Collect snapshots (no API calls — pure in-memory reads)
+                snaps = []
                 for inst in self._app.selected:
-                    key=_engine_key(inst['security_id'], inst['exchange'])
-                    eng=self._app.engines.get(key)
+                    key = _engine_key(inst['security_id'], inst['exchange'])
+                    eng = self._app.engines.get(key)
                     if eng is None: continue
-                    with eng.lock:
-                        wc=eng.last_option_tick_wc; has=eng.position is not None
-                    if has and (now_ts-wc)>5.0: eng.poll_option_prices()
-                    snap=eng.snapshot(); snaps.append(snap)
-                    row=self._rows.get(key)
+                    snap = eng.snapshot()
+                    snaps.append((key, snap))
+                    row = self._rows.get(key)
                     if row: row.update(snap)
 
-                # trade log
-                lines=[]
-                for s in snaps:
-                    nm=s['instrument']['name']
-                    for r in s['trade_log'][:5]: lines.append(f"[{nm}]  {r}")
-                lines.sort(reverse=True)
-                self.log_box.configure(state='normal')
-                self.log_box.delete('1.0','end')
-                self.log_box.insert('end', '\n'.join(lines) if lines else 'No trades yet.')
-                self.log_box.configure(state='disabled')
+                # Trade log — refresh every 3 ticks to reduce CPU
+                self._tick_count = getattr(self, '_tick_count', 0) + 1
+                if self._tick_count % 3 == 0:
+                    lines = []
+                    for _, s in snaps:
+                        nm = s['instrument']['name']
+                        for r in s['trade_log'][:5]:
+                            lines.append(f"[{nm}]  {r}")
+                    lines.sort(reverse=True)
+                    self.log_box.configure(state='normal')
+                    self.log_box.delete('1.0','end')
+                    self.log_box.insert('end', '\n'.join(lines) if lines else 'No trades yet.')
+                    self.log_box.configure(state='disabled')
 
-                # forming candles
-                fc_lines=[]
-                for s in snaps:
-                    nm=s['instrument']['name']; c3=s['current_3m']; nxt=s.get('next_eval') or '—'
-                    if c3:
-                        t=epoch_to_local_str(c3['bucket'],False)
-                        fc_lines.append(f"{nm:<18} [{t}] O:{c3['open']:.1f} H:{c3['high']:.1f} L:{c3['low']:.1f} C:{c3['close']:.1f} {c3.get('parts',0)}/3  next:{nxt}")
-                    else:
-                        fc_lines.append(f"{nm:<18} awaiting…  next:{nxt}")
-                self.forming_box.configure(state='normal')
-                self.forming_box.delete('1.0','end')
-                self.forming_box.insert('end', '\n'.join(fc_lines) if fc_lines else '—')
-                self.forming_box.configure(state='disabled')
+                    fc_lines = []
+                    for _, s in snaps:
+                        nm  = s['instrument']['name']
+                        c3  = s['current_3m']
+                        nxt = s.get('next_eval') or '—'
+                        if c3:
+                            t = epoch_to_local_str(c3['bucket'], False)
+                            fc_lines.append(
+                                f"{nm:<18} [{t}] O:{c3['open']:.1f} H:{c3['high']:.1f} "
+                                f"L:{c3['low']:.1f} C:{c3['close']:.1f} "
+                                f"{c3.get('parts',0)}/3  next:{nxt}")
+                        else:
+                            fc_lines.append(f"{nm:<18} awaiting…  next:{nxt}")
+                    self.forming_box.configure(state='normal')
+                    self.forming_box.delete('1.0','end')
+                    self.forming_box.insert('end', '\n'.join(fc_lines) if fc_lines else '—')
+                    self.forming_box.configure(state='disabled')
             else:
                 self.lbl_ws.configure(text='● WS: offline', text_color=RED)
-        except Exception: pass
+        except Exception:
+            pass
         self.after(1000, self._tick)
 
     def _on_close(self):
