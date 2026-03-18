@@ -897,6 +897,7 @@ class IndexPaperEngine:
         self.entry_lot_size: Optional[int] = None
         self.entry_expiry: Optional[str] = None
         self.last_option_tick_wc: float = 0.0   # wall-clock time of last WS option tick (time.time())
+        self.option_tick_count: int = 0            # total WS option ticks received for active position
         self._pending_option_sub_req: Optional[Dict[str, str]] = None  # consumed by App.process_option_subscriptions
         self.option_chain_expiry: Optional[str] = None
         self.option_chain_last_fetch: float = 0.0
@@ -1025,7 +1026,8 @@ class IndexPaperEngine:
         with self.lock:
             if self.entry_option_security_id and str(self.entry_option_security_id) == str(option_sec):
                 self.current_option_price = premium
-                self.last_option_tick_wc = time.time()  # wall-clock, safe to compare with time.time() in ui_loop
+                self.last_option_tick_wc = time.time()
+                self.option_tick_count += 1
 
     def pop_option_subscribe_request(self) -> Optional[Dict[str,str]]:
         with self.lock:
@@ -1111,91 +1113,18 @@ class IndexPaperEngine:
 
 
     def _refresh_option_chain_locked(self, force: bool = False) -> bool:
-        now_ts = time.time()
-
-        # If we are cooling down due to rate limit, don't hammer the API.
-        if now_ts < float(self.option_chain_cooldown_until):
-            return bool(self.option_chain_map)
-
-        # Hard minimum interval between optionchain calls.
-        if self.option_chain_map and (now_ts - float(self.option_chain_last_fetch) < self.option_chain_min_interval):
-            return True
-
-        # Softer refresh interval (normal polling)
-        if (not force) and self.option_chain_map and (now_ts - float(self.option_chain_last_fetch) < OPTION_REFRESH_SEC):
-            return True
-
-        expiry = self.option_chain_expiry
-        if force or not expiry:
-            expiry = fetch_option_expiry(self.instrument['security_id'], self.instrument['exchange'])
-            if not expiry:
-                return False
-            self.option_chain_expiry = expiry
-
-        chain = fetch_option_chain(self.instrument['security_id'], self.instrument['exchange'], self.option_chain_expiry)
-        if isinstance(chain, dict) and chain.get('_status_code'):
-            sc = int(chain.get('_status_code'))
-            if sc == 429:
-                self.option_chain_cooldown_until = time.time() + 8.0
-            return False
-        if not chain and force:
-            fresh = fetch_option_expiry(self.instrument['security_id'], self.instrument['exchange'])
-            if fresh:
-                self.option_chain_expiry = fresh
-                chain = fetch_option_chain(self.instrument['security_id'], self.instrument['exchange'], self.option_chain_expiry)
-        if not chain:
-            return False
-
-        oc = chain.get('oc') or {}
-        parsed: Dict[Tuple[int, str], Dict[str, Any]] = {}
-        for strike_key, node in oc.items():
-            try:
-                strike = int(round(float(strike_key)))
-            except Exception:
-                continue
-            if not isinstance(node, dict):
-                continue
-            for side in ('CE', 'PE'):
-                leg = node.get(side) or node.get(side.lower()) or {}
-                if not isinstance(leg, dict):
-                    continue
-                premium = leg.get('last_price', leg.get('lastPrice', leg.get('ltp')))
-                secid = leg.get('security_id', leg.get('securityId', leg.get('sid')))
-                if premium is None or secid in (None, ''):
-                    continue
-                try:
-                    prem_val = float(premium)
-                    sid_str = str(secid)
-                except Exception:
-                    continue
-                lot_size = resolve_lot_size_from_master(sid_str, safe_int(self.instrument.get('default_lot_size'), 1))
-                parsed[(strike, side)] = {
-                    'strike': strike,
-                    'side': side,
-                    'premium': prem_val,
-                    'security_id': sid_str,
-                    'lot_size': int(lot_size),
-                    'expiry': self.option_chain_expiry,
-                }
-
-        if not parsed:
-            return False
-
-        self.option_chain_map = parsed
-        self.option_chain_last_fetch = now_ts
-        try:
-            self.option_chain_underlying = float(chain.get('last_price')) if chain.get('last_price') is not None else self.last_ltp
-        except Exception:
-            self.option_chain_underlying = self.last_ltp
-        self.option_chain_last_fetch = now_ts
-        self.option_chain_cooldown_until: float = 0.0  # set when 429 rate-limit happens
-        self.option_chain_min_interval: float = 3.2  # seconds (Dhan recommends >=3s)
-        return True
+        """Cache-only read — NEVER makes HTTP calls (lock may be held by strategy thread).
+        Returns True if option_chain_map has usable data, False if empty.
+        All HTTP fetching is done by poll_option_prices() in the background thread.
+        """
+        return bool(self.option_chain_map)
 
     def _resolve_option_snapshot_locked(self, side: str, price: float, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         if side not in ('CE', 'PE'):
             return None
-        if not self._refresh_option_chain_locked(force=False):
+        # option_chain_map is populated by poll_option_prices() background thread.
+        # If empty, return None — bg thread will populate it and entry retries next candle.
+        if not self.option_chain_map:
             return None
         desired = self._atm_strike(price)
         candidates = []
@@ -1400,6 +1329,7 @@ class IndexPaperEngine:
         self.entry_lot_size = int(snap['lot_size'])
         self.entry_expiry = snap.get('expiry')
         self.last_option_tick_wc = 0.0  # reset so fallback polling activates until first WS tick arrives
+        self.option_tick_count = 0
         # Queue a WS subscription for this option contract — picked up by App.process_option_subscriptions()
         self._pending_option_sub_req = {
             'security_id': str(snap['security_id']),
@@ -1535,6 +1465,8 @@ class IndexPaperEngine:
                 'trade_log': list(self.trade_log),
                 'next_eval': next_eval,
                 'note': note,
+                'option_tick_count': self.option_tick_count,
+                'last_option_tick_wc': self.last_option_tick_wc,
             }
 
 
@@ -1845,12 +1777,13 @@ def _creds_ok():
 
 # ── dashboard table columns ────────────────────────────────────────────────────
 COL_W={'name':130,'ltp':100,'chg':85,'orb_h':78,'orb_l':78,'st':80,
-       'trend':65,'pos':160,'entry':68,'last_p':68,'unreal':95,'real':95,'note':190}
+       'trend':65,'pos':160,'entry':68,'last_p':68,'unreal':95,'real':95,
+       'opt_src':90,'note':170}
 COLS=list(COL_W.keys())
 COL_HDR={'name':'INSTRUMENT','ltp':'LTP','chg':'CHG%','orb_h':'ORB H',
          'orb_l':'ORB L','st':'ST','trend':'TREND','pos':'POSITION',
          'entry':'ENTRY P','last_p':'LAST P','unreal':'UNREAL ₹',
-         'real':'REAL ₹','note':'STATUS'}
+         'real':'REAL ₹','opt_src':'PREM SRC','note':'STATUS'}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1911,6 +1844,22 @@ class DashboardRow:
             self.cells['real'].configure(
                 text=f"{_sgn(rr)}₹{rr:,.0f}" if rr else '—', text_color=_pnl_col(rr))
         self.cells['note'].configure(text=(snap.get('note') or '')[:28], text_color=YELLOW)
+
+        # Option WS tick counter
+        pos = snap.get('position')
+        if pos:
+            ticks = snap.get('option_tick_count', 0)
+            wc    = snap.get('last_option_tick_wc', 0.0)
+            age   = int(time.time() - wc) if wc else 0
+            if ticks == 0:
+                src_txt = 'WS: pending'
+                src_col = YELLOW
+            else:
+                src_txt = f'WS {ticks}t ({age}s ago)'
+                src_col = GREEN
+            self.cells['opt_src'].configure(text=src_txt, text_color=src_col)
+        else:
+            self.cells['opt_src'].configure(text='—', text_color=MUTED)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2375,11 +2324,13 @@ class MainWindow(ctk.CTk):
                             fno_ex = inst.get('fno_exchange', 'NSE_FNO')
                         if has:
                             ws_age = now_ts - wc
-                            if ws_age > 5.0:
-                                eng.poll_option_prices()
-                            # Re-queue WS subscription if ticks dry up >10s
-                            # Recovers from subscription loss on WS reconnect
-                            if ws_age > 10.0 and sid:
+                            # WS-only premium tracking — no REST fallback.
+                            # If no tick arrived, price simply hasn't changed (valid for
+                            # illiquid stock options that can be silent for minutes).
+                            # Only re-queue WS subscription if silent for 5 minutes —
+                            # that indicates a genuine subscription loss, not just
+                            # a quiet market.
+                            if ws_age > 300.0 and sid:
                                 self._app.subscribed_secids.discard(
                                     _engine_key(str(sid), fno_ex))
                                 with eng.lock:
