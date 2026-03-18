@@ -1209,15 +1209,78 @@ class IndexPaperEngine:
         return dict(candidates[0][2])
 
     def poll_option_prices(self):
+        # Phase 1: read state needed for the fetch (lock held briefly)
         with self.lock:
-            ok = self._refresh_option_chain_locked(force=False)
-            if not ok:
-                return
             if self.position is None or self.entry_strike is None:
                 return
-            snap = self.option_chain_map.get((int(self.entry_strike), str(self.position)))
-            if snap is None:
-                snap = self._resolve_option_snapshot_locked(str(self.position), self.last_ltp or self.entry_price or 0.0, force_refresh=False)
+            strike   = self.entry_strike
+            position = self.position
+            ltp      = self.last_ltp or self.entry_price or 0.0
+            expiry   = self.option_chain_expiry
+            now_ts   = time.time()
+            # Respect cooldown (rate-limit) and min interval without making HTTP call
+            if now_ts < float(self.option_chain_cooldown_until):
+                return
+            if self.option_chain_map and (now_ts - float(self.option_chain_last_fetch) < self.option_chain_min_interval):
+                # Cache is fresh enough — just read from it, no HTTP needed
+                snap = self.option_chain_map.get((int(strike), str(position)))
+                if snap:
+                    self.current_option_price = float(snap['premium'])
+                return
+
+        # Phase 2: fetch expiry if needed (NO lock held — network I/O)
+        if not expiry:
+            expiry = fetch_option_expiry(self.instrument['security_id'], self.instrument['exchange'])
+            if not expiry:
+                return
+
+        # Phase 3: fetch option chain (NO lock held — network I/O)
+        chain = fetch_option_chain(self.instrument['security_id'], self.instrument['exchange'], expiry)
+
+        # Phase 4: process result and update state (lock held briefly)
+        with self.lock:
+            if self.position is None:  # position may have closed during the fetch
+                return
+            if isinstance(chain, dict) and chain.get('_status_code'):
+                sc = int(chain.get('_status_code', 0))
+                if sc == 429:
+                    self.option_chain_cooldown_until = time.time() + 8.0
+                return
+            if not chain:
+                return
+            oc = chain.get('oc') or {}
+            now_ts2 = time.time()
+            # Parse the freshly fetched chain
+            for strike_key, node in oc.items():
+                try:
+                    sk = int(round(float(strike_key)))
+                except Exception:
+                    continue
+                if not isinstance(node, dict):
+                    continue
+                for side in ('CE', 'PE'):
+                    leg = node.get(side) or node.get(side.lower()) or {}
+                    if not isinstance(leg, dict):
+                        continue
+                    premium = leg.get('last_price', leg.get('lastPrice', leg.get('ltp')))
+                    secid   = leg.get('security_id', leg.get('securityId', leg.get('sid')))
+                    if premium is None or secid in (None, ''):
+                        continue
+                    try:
+                        prem_val = float(premium)
+                        sid_str  = str(secid)
+                    except Exception:
+                        continue
+                    lot_size = resolve_lot_size_from_master(sid_str, safe_int(self.instrument.get('default_lot_size'), 1))
+                    self.option_chain_map[(sk, side)] = {
+                        'strike': sk, 'side': side, 'premium': prem_val,
+                        'security_id': sid_str, 'lot_size': int(lot_size),
+                        'expiry': expiry,
+                    }
+            self.option_chain_last_fetch = now_ts2
+            self.option_chain_expiry = expiry
+            # Now update current_option_price from fresh cache
+            snap = self.option_chain_map.get((int(self.entry_strike or 0), str(self.position or '')))
             if snap:
                 self.current_option_price = float(snap['premium'])
 
