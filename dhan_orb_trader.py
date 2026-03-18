@@ -1845,7 +1845,7 @@ class DashboardRow:
                 text=f"{_sgn(rr)}₹{rr:,.0f}" if rr else '—', text_color=_pnl_col(rr))
         self.cells['note'].configure(text=(snap.get('note') or '')[:28], text_color=YELLOW)
 
-        # Option WS tick counter
+        # Option premium source indicator
         pos = snap.get('position')
         if pos:
             ticks = snap.get('option_tick_count', 0)
@@ -1855,11 +1855,16 @@ class DashboardRow:
                 src_txt = 'WS: pending'
                 src_col = YELLOW
             else:
-                src_txt = f'WS {ticks}t ({age}s ago)'
+                src_txt = f'WS {ticks}t ({age}s)'
                 src_col = GREEN
             self.cells['opt_src'].configure(text=src_txt, text_color=src_col)
         else:
-            self.cells['opt_src'].configure(text='—', text_color=MUTED)
+            # No position — show whether option chain map is populated
+            from_snap = snap.get('note','')
+            chain_ok = 'unavailable' not in from_snap.lower()
+            self.cells['opt_src'].configure(
+                text='chain ok' if chain_ok else 'fetching…',
+                text_color=MUTED)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2306,8 +2311,14 @@ class MainWindow(ctk.CTk):
         self.lbl_ws.configure(text='● WS: offline', text_color=RED)
 
     def _start_bg_loop(self):
-        """Background thread: option subscriptions + fallback polling.
-        Kept off the main tkinter thread so GUI never blocks on network I/O."""
+        """Background thread: option subscriptions + option chain pre-fetch.
+
+        Two responsibilities:
+        1. Keep option_chain_map populated when NO position is open
+           so _enter_locked always has fresh strikes available.
+        2. Once IN a position, rely purely on WS ticks — no REST polling.
+           Only re-queue WS subscription if silent for 5 minutes (genuine loss).
+        """
         while self._running:
             try:
                 if self._app:
@@ -2318,18 +2329,20 @@ class MainWindow(ctk.CTk):
                         eng = self._app.engines.get(key)
                         if eng is None: continue
                         with eng.lock:
-                            wc     = eng.last_option_tick_wc
                             has    = eng.position is not None
+                            wc     = eng.last_option_tick_wc
                             sid    = eng.entry_option_security_id
                             fno_ex = inst.get('fno_exchange', 'NSE_FNO')
-                        if has:
+                            ltp    = eng.last_ltp
+
+                        if not has:
+                            # No position — poll option chain so map stays fresh for entry.
+                            # This is the ONLY time we hit REST for option data.
+                            eng.poll_option_prices()
+                        else:
+                            # In a position — WS only. No REST polling.
+                            # Only re-subscribe if genuinely silent for 5 minutes.
                             ws_age = now_ts - wc
-                            # WS-only premium tracking — no REST fallback.
-                            # If no tick arrived, price simply hasn't changed (valid for
-                            # illiquid stock options that can be silent for minutes).
-                            # Only re-queue WS subscription if silent for 5 minutes —
-                            # that indicates a genuine subscription loss, not just
-                            # a quiet market.
                             if ws_age > 300.0 and sid:
                                 self._app.subscribed_secids.discard(
                                     _engine_key(str(sid), fno_ex))
@@ -2340,7 +2353,7 @@ class MainWindow(ctk.CTk):
                                     }
             except Exception:
                 pass
-            time.sleep(1.0)
+            time.sleep(3.0)  # 3s is enough for pre-entry refresh; respects Dhan rate limits
 
     # ── 1-second GUI tick (pure GUI work — no API calls) ─────────────────────
     def _tick(self):
