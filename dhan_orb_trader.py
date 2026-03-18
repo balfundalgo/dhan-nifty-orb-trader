@@ -1137,6 +1137,76 @@ class IndexPaperEngine:
         candidates.sort(key=lambda x: (x[0], x[1]))
         return dict(candidates[0][2])
 
+    def prefetch_option_chain(self):
+        """Fetch and cache option chain when NO position is open.
+        Called by bg thread every 3s so map is always ready for instant entry.
+        Never called when position is open — that's WS-only territory.
+        """
+        # Phase 1: check if we need a fetch (lock held briefly)
+        with self.lock:
+            if self.position is not None:
+                return  # In a trade — WS handles it, don't touch chain
+            now_ts  = time.time()
+            expiry  = self.option_chain_expiry
+            ltp     = self.last_ltp
+            if now_ts < float(self.option_chain_cooldown_until):
+                return
+            if self.option_chain_map and (now_ts - float(self.option_chain_last_fetch) < self.option_chain_min_interval):
+                return  # Cache is fresh enough
+
+        # Phase 2: fetch expiry if missing (no lock)
+        if not expiry:
+            expiry = fetch_option_expiry(
+                self.instrument['security_id'], self.instrument['exchange'])
+            if not expiry:
+                return
+
+        # Phase 3: fetch chain (no lock)
+        chain = fetch_option_chain(
+            self.instrument['security_id'], self.instrument['exchange'], expiry)
+
+        # Phase 4: parse and store (lock held briefly)
+        with self.lock:
+            if self.position is not None:
+                return  # Position opened while we were fetching — leave it to WS
+            if isinstance(chain, dict) and chain.get('_status_code'):
+                if int(chain.get('_status_code', 0)) == 429:
+                    self.option_chain_cooldown_until = time.time() + 8.0
+                return
+            if not chain:
+                return
+            oc = chain.get('oc') or {}
+            now_ts2 = time.time()
+            for strike_key, node in oc.items():
+                try:
+                    sk = int(round(float(strike_key)))
+                except Exception:
+                    continue
+                if not isinstance(node, dict):
+                    continue
+                for side in ('CE', 'PE'):
+                    leg = node.get(side) or node.get(side.lower()) or {}
+                    if not isinstance(leg, dict):
+                        continue
+                    premium = leg.get('last_price', leg.get('lastPrice', leg.get('ltp')))
+                    secid   = leg.get('security_id', leg.get('securityId', leg.get('sid')))
+                    if premium is None or secid in (None, ''):
+                        continue
+                    try:
+                        prem_val = float(premium)
+                        sid_str  = str(secid)
+                    except Exception:
+                        continue
+                    lot_size = resolve_lot_size_from_master(
+                        sid_str, safe_int(self.instrument.get('default_lot_size'), 1))
+                    self.option_chain_map[(sk, side)] = {
+                        'strike': sk, 'side': side, 'premium': prem_val,
+                        'security_id': sid_str, 'lot_size': int(lot_size),
+                        'expiry': expiry,
+                    }
+            self.option_chain_last_fetch = now_ts2
+            self.option_chain_expiry = expiry
+
     def poll_option_prices(self):
         # Phase 1: read state needed for the fetch (lock held briefly)
         with self.lock:
@@ -2336,9 +2406,9 @@ class MainWindow(ctk.CTk):
                             ltp    = eng.last_ltp
 
                         if not has:
-                            # No position — poll option chain so map stays fresh for entry.
+                            # No position — prefetch chain so map stays fresh for entry.
                             # This is the ONLY time we hit REST for option data.
-                            eng.poll_option_prices()
+                            eng.prefetch_option_chain()
                         else:
                             # In a position — WS only. No REST polling.
                             # Only re-subscribe if genuinely silent for 5 minutes.
