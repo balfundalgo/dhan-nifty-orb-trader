@@ -480,7 +480,13 @@ def preload_instrument_master() -> None:
         lines = r.text.splitlines()
         reader = csv.DictReader(lines)
         local: Dict[str, int] = {}
+        # Only cache F&O rows — equity rows have LOT_SIZE=1 which would
+        # overwrite the real F&O lot size for the same underlying security_id.
+        FNO_INSTRUMENTS = {'OPTSTK', 'OPTIDX', 'FUTSTK', 'FUTIDX', 'FUTCOM', 'OPTFUT'}
         for row in reader:
+            instr = str(row.get('INSTRUMENT') or '').strip().upper()
+            if instr not in FNO_INSTRUMENTS:
+                continue
             sid = str(row.get('SECURITY_ID') or '').strip()
             if not sid:
                 continue
