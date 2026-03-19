@@ -1413,16 +1413,24 @@ class IndexPaperEngine:
         st_val = self.st.value
         st_dir = self.st.dir
 
-        # exits first
-        if self.position == 'CE':
-            if self.orb_ready and self.orb_low is not None and c <= float(self.orb_low):
-                self._exit_locked(c, bucket, 'ORB low SL')
-            elif st_val is not None and c < float(st_val):
+        # exits first — rules depend on market phase
+        if hm < 10 * 60:
+            # Pre-10: ORB SL applies, then ST
+            if self.position == 'CE':
+                if self.orb_ready and self.orb_low is not None and c <= float(self.orb_low):
+                    self._exit_locked(c, bucket, 'ORB low SL')
+                elif st_val is not None and c < float(st_val):
+                    self._exit_locked(c, bucket, 'close below ST')
+            elif self.position == 'PE':
+                if self.orb_ready and self.orb_high is not None and c >= float(self.orb_high):
+                    self._exit_locked(c, bucket, 'ORB high SL')
+                elif st_val is not None and c > float(st_val):
+                    self._exit_locked(c, bucket, 'close above ST')
+        else:
+            # Post-10: Supertrend only — ORB levels are irrelevant
+            if self.position == 'CE' and st_val is not None and c < float(st_val):
                 self._exit_locked(c, bucket, 'close below ST')
-        elif self.position == 'PE':
-            if self.orb_ready and self.orb_high is not None and c >= float(self.orb_high):
-                self._exit_locked(c, bucket, 'ORB high SL')
-            elif st_val is not None and c > float(st_val):
+            elif self.position == 'PE' and st_val is not None and c > float(st_val):
                 self._exit_locked(c, bucket, 'close above ST')
 
         # Before 09:15 no trading; 09:15-09:24 wait for ORB
