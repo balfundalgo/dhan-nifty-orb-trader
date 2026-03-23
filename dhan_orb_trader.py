@@ -73,8 +73,11 @@ TRADE_MODE = os.getenv('TRADE_MODE', 'NIFTY').strip().upper()
 ST_ATR_LEN = 10
 ST_FACTOR = 3.0
 BOOTSTRAP_HISTORY = True
-BOOTSTRAP_LOOKBACK_DAYS = 10
-BOOTSTRAP_CANDLES_1M = 3000
+# Dhan API allows up to 90 days per intraday request.
+# More history = better ST convergence (Dhan's own chart likely uses 60-90 days).
+# 90 days × ~375 market 1m candles/day ≈ 33,750 candles per instrument.
+BOOTSTRAP_LOOKBACK_DAYS = 90
+BOOTSTRAP_CANDLES_1M = 35000
 BOOTSTRAP_DEBUG = True
 REFRESH_EVERY_SEC = 1.0
 SHOW_3M_HISTORY = 8
@@ -821,7 +824,10 @@ class SupertrendState:
                 self.prev_close = float(c)
                 self.last_signal = None
                 return
+            # SMA seed — set prev_close NOW so the very next bar's TR uses
+            # this bar's close, not the previous bar's (matches MQL5 behaviour)
             self.atr = sum(self.tr_q) / float(n)
+            self.prev_close = float(c)
         else:
             alpha = 1.0 / float(n)
             self.atr = alpha * float(tr) + (1.0 - alpha) * float(self.atr)
@@ -1300,8 +1306,11 @@ class IndexPaperEngine:
         lot_txt = '-'
         if self.entry_lot_size:
             lot_txt = f'qty {int(self.entry_lot_size) * int(self.entry_lots)}'
-        self.trade_log.appendleft(f'{stamp} | {action:<5} | {opt_txt:<26} | idx {price:,.2f} | {prem_txt:<14} | {lot_txt:<8} | {note}')
+        line = f'{stamp} | {action:<5} | {opt_txt:<26} | idx {price:,.2f} | {prem_txt:<14} | {lot_txt:<8} | {note}'
+        self.trade_log.appendleft(line)
         self.last_strategy_note = note
+        # Write to day-wise trade log file
+        _append_to_trade_log(line, self.instrument.get('name', self.instrument.get('key', '')))
         # Fire Telegram alert (non-blocking)
         self._send_telegram_alert(action, side, strike, price, bucket, note)
 
@@ -1391,6 +1400,15 @@ class IndexPaperEngine:
             return
         if self.position is not None:
             self._exit_locked(price, bucket, f'reverse to {side}')
+
+        # If chain map is empty, fetch on-demand now (outside lock via temp release)
+        if not self.option_chain_map:
+            self.lock.release()
+            try:
+                self.prefetch_option_chain()
+            finally:
+                self.lock.acquire()
+
         snap = self._resolve_option_snapshot_locked(side, price, force_refresh=False)
         if not snap:
             self.last_strategy_note = f'option chain unavailable for {side} entry'
@@ -1619,6 +1637,7 @@ class App:
         with self.stats_lock:
             self.last_ws_connect_time = int(time.time())
             self.last_ws_error = None
+        _append_to_day_log("WS CONNECTED")
 
         # Reset subscribed_secids on every (re)connect so option contracts
         # get resubscribed — WS reconnect silently drops all option subscriptions.
@@ -1719,6 +1738,7 @@ class App:
     def on_error(self, ws, error):
         with self.stats_lock:
             self.last_ws_error = str(error)
+        _append_to_day_log(f"WS ERROR: {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
         return
@@ -1748,6 +1768,7 @@ class App:
                 print(f"  {inst['name']}: bootstrapped {len(hist)} x 1m candles.")
             else:
                 print(f"  {inst['name']}: history unavailable. Continuing with live warmup.")
+                _append_to_day_log(f"BOOTSTRAP {inst['name']}: history unavailable")
 
     def run_ws_loop(self):
         websocket.enableTrace(False)
@@ -1831,6 +1852,36 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = Path(__file__).parent
 ENV_PATH = BASE_DIR / '.env'
+
+# ── Day-wise log directories ──────────────────────────────────────────────────
+def _today_log_dir() -> Path:
+    """Returns BASE_DIR/logs/YYYY-MM-DD/ — created if it doesn't exist."""
+    d = BASE_DIR / 'logs' / now_local().strftime('%Y-%m-%d')
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _append_to_day_log(msg: str) -> None:
+    """Append a line to today's runtime log file."""
+    try:
+        log_file = _today_log_dir() / 'runtime.log'
+        ts = now_local().strftime('%H:%M:%S')
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"[{ts}]  {msg}\n")
+    except Exception:
+        pass
+
+def _append_to_trade_log(trade_line: str, inst_name: str) -> None:
+    """Append a trade entry to today's trade log CSV."""
+    try:
+        log_file = _today_log_dir() / 'trades.csv'
+        write_header = not log_file.exists()
+        ts = now_local().strftime('%H:%M:%S')
+        with open(log_file, 'a', encoding='utf-8', newline='') as f:
+            if write_header:
+                f.write('time,instrument,entry\n')
+            f.write(f"{ts},{inst_name},{trade_line}\n")
+    except Exception:
+        pass
 
 # ── palette ───────────────────────────────────────────────────────────────────
 BG='#0d1117'; PANEL='#161b22'; DARK='#1c2128'; BORDER='#30363d'
@@ -2395,13 +2446,8 @@ class MainWindow(ctk.CTk):
         self.lbl_ws.configure(text='● WS: offline', text_color=RED)
 
     def _start_bg_loop(self):
-        """Background thread: option subscriptions + option chain pre-fetch.
-
-        Two responsibilities:
-        1. Keep option_chain_map populated when NO position is open
-           so _enter_locked always has fresh strikes available.
-        2. Once IN a position, rely purely on WS ticks — no REST polling.
-           Only re-queue WS subscription if silent for 5 minutes (genuine loss).
+        """Background thread: option WS subscriptions + reconnect recovery only.
+        No REST polling at all — option chain is fetched on-demand at entry time.
         """
         while self._running:
             try:
@@ -2417,15 +2463,8 @@ class MainWindow(ctk.CTk):
                             wc     = eng.last_option_tick_wc
                             sid    = eng.entry_option_security_id
                             fno_ex = inst.get('fno_exchange', 'NSE_FNO')
-                            ltp    = eng.last_ltp
-
-                        if not has:
-                            # No position — prefetch chain so map stays fresh for entry.
-                            # This is the ONLY time we hit REST for option data.
-                            eng.prefetch_option_chain()
-                        else:
-                            # In a position — WS only. No REST polling.
-                            # Only re-subscribe if genuinely silent for 5 minutes.
+                        if has:
+                            # Re-subscribe if WS silent for 5 minutes (genuine loss)
                             ws_age = now_ts - wc
                             if ws_age > 300.0 and sid:
                                 self._app.subscribed_secids.discard(
@@ -2437,7 +2476,7 @@ class MainWindow(ctk.CTk):
                                     }
             except Exception:
                 pass
-            time.sleep(3.0)  # 3s is enough for pre-entry refresh; respects Dhan rate limits
+            time.sleep(1.0)
 
     # ── 1-second GUI tick (pure GUI work — no API calls) ─────────────────────
     def _tick(self):
