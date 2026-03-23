@@ -794,83 +794,96 @@ def _get_alerter() -> 'TelegramAlerter':
 
 
 # ---------------- supertrend ----------------
+# Exact logic from SupertrendEngine reference file.
+# Key correctness point: prev_close is updated at the VERY END of update(),
+# AFTER band persistence calculations — so band logic always uses the
+# previous bar's close, not the current one.
 class SupertrendState:
     def __init__(self, atr_len: int, factor: float):
-        self.atr_len = int(atr_len)
-        self.factor = float(factor)
+        self.atr_len  = int(atr_len)
+        self.factor   = float(factor)
         self.prev_close: Optional[float] = None
-        self.tr_q = deque(maxlen=max(1, int(atr_len)))
-        self.atr: Optional[float] = None
-        self.fub: Optional[float] = None
-        self.flb: Optional[float] = None
-        self.value: Optional[float] = None
-        self.dir: Optional[int] = None
-        self.last_signal: Optional[str] = None
+        self.tr_q     = deque(maxlen=max(1, int(atr_len)))
+        self.atr:     Optional[float] = None
+        self.fub:     Optional[float] = None   # final upper band
+        self.flb:     Optional[float] = None   # final lower band
+        self.value:   Optional[float] = None   # current ST value
+        self.dir:     Optional[int]   = None   # +1 uptrend, -1 downtrend
+        self.last_signal: Optional[str] = None # 'UP' / 'DOWN' on flip only
 
     def reset(self) -> None:
         self.__init__(self.atr_len, self.factor)
 
-    def update(self, o: float, h: float, l: float, c: float) -> None:
-        if self.prev_close is None:
-            tr = float(h) - float(l)
-        else:
-            pc = float(self.prev_close)
-            tr = max(float(h) - float(l), abs(float(h) - pc), abs(float(l) - pc))
+    def _true_range(self, h: float, l: float, prev_close: Optional[float]) -> float:
+        if prev_close is None:
+            return float(h) - float(l)
+        pc = float(prev_close)
+        return max(float(h) - float(l), abs(float(h) - pc), abs(float(l) - pc))
 
+    def update(self, o: float, h: float, l: float, c: float) -> None:
+        # Step 1: True Range — uses prev_close from PREVIOUS bar (not yet updated)
+        tr = self._true_range(h, l, self.prev_close)
         self.tr_q.append(float(tr))
+
         n = self.atr_len
+
+        # Step 2: ATR
         if self.atr is None:
             if len(self.tr_q) < n:
+                # Warming up — collect TR values, update prev_close, return early
                 self.prev_close = float(c)
                 self.last_signal = None
                 return
-            # SMA seed — set prev_close NOW so the very next bar's TR uses
-            # this bar's close, not the previous bar's (matches MQL5 behaviour)
+            # SMA seed on nth bar
             self.atr = sum(self.tr_q) / float(n)
-            self.prev_close = float(c)
         else:
+            # Wilder RMA: alpha = 1/n  (matches TradingView / Dhan chart)
             alpha = 1.0 / float(n)
             self.atr = alpha * float(tr) + (1.0 - alpha) * float(self.atr)
 
-        atr = float(self.atr)
+        # Step 3: Basic bands
         hl2 = (float(h) + float(l)) / 2.0
-        basic_upper = hl2 + self.factor * atr
-        basic_lower = hl2 - self.factor * atr
+        basic_upper = hl2 + self.factor * float(self.atr)
+        basic_lower = hl2 - self.factor * float(self.atr)
 
+        # Step 4: Final band persistence
+        # Uses self.prev_close which is still the PREVIOUS bar's close here
         prev_upper = basic_upper if self.fub is None else float(self.fub)
         prev_lower = basic_lower if self.flb is None else float(self.flb)
-        prev_close = float(c) if self.prev_close is None else float(self.prev_close)
+        pc         = float(self.prev_close) if self.prev_close is not None else float(c)
 
-        upper = basic_upper if (basic_upper < prev_upper or prev_close > prev_upper) else prev_upper
-        lower = basic_lower if (basic_lower > prev_lower or prev_close < prev_lower) else prev_lower
+        upper = basic_upper if (basic_upper < prev_upper or pc > prev_upper) else prev_upper
+        lower = basic_lower if (basic_lower > prev_lower or pc < prev_lower) else prev_lower
 
-        signal = None
+        # Step 5: Direction and ST value
+        flip_signal = None
         if self.dir is None:
             direction = 1
-            st_val = lower
-        else:
-            if int(self.dir) == 1:
-                if float(c) < lower:
-                    direction = -1
-                    st_val = upper
-                    signal = 'DOWN'
-                else:
-                    direction = 1
-                    st_val = lower
+            st_val    = lower
+        elif int(self.dir) == 1:
+            if float(c) < lower:
+                direction   = -1
+                st_val      = upper
+                flip_signal = 'DOWN'
             else:
-                if float(c) > upper:
-                    direction = 1
-                    st_val = lower
-                    signal = 'UP'
-                else:
-                    direction = -1
-                    st_val = upper
+                direction = 1
+                st_val    = lower
+        else:
+            if float(c) > upper:
+                direction   = 1
+                st_val      = lower
+                flip_signal = 'UP'
+            else:
+                direction = -1
+                st_val    = upper
 
-        self.fub = float(upper)
-        self.flb = float(lower)
-        self.value = float(st_val)
-        self.dir = int(direction)
-        self.last_signal = signal
+        # Step 6: Commit state
+        self.fub        = float(upper)
+        self.flb        = float(lower)
+        self.value      = float(st_val)
+        self.dir        = int(direction)
+        self.last_signal = flip_signal
+        # prev_close updated LAST — so all calculations above used previous bar's close
         self.prev_close = float(c)
 
 
@@ -988,10 +1001,34 @@ class IndexPaperEngine:
             self.realized_pnl_rupees = 0.0
             self.trade_log.clear()
             self.last_strategy_note = 'waiting for market to open'
+            # Pre-seed prev_close from the last candle of any prior day so that
+            # the very first 1m bar of each day uses the correct previous close
+            # for True Range calculation — matching Dhan's chart behaviour.
+            prev_day_close: Optional[float] = None
+            prev_day_key: Optional[str] = None
+
             for cd in candles_1m:
+                bucket = int(cd['time'])
+                dt     = epoch_to_local_dt(bucket)
+                day    = dt.strftime('%Y-%m-%d')
+
+                # When day changes, check if ST's prev_close needs seeding
+                if prev_day_key is not None and day != prev_day_key:
+                    # First candle of a new day — if ST has no prev_close yet,
+                    # seed it from the last close of the previous day
+                    if self.st.prev_close is None and prev_day_close is not None:
+                        self.st.prev_close = prev_day_close
+                    elif prev_day_close is not None:
+                        # ST already running — ensure prev_close is set correctly
+                        # so the first TR of today uses yesterday's close
+                        self.st.prev_close = prev_day_close
+
                 self._ingest_completed_1m_locked(
-                    int(cd['time']), float(cd['open']), float(cd['high']), float(cd['low']), float(cd['close']), historical=True
+                    bucket, float(cd['open']), float(cd['high']),
+                    float(cd['low']), float(cd['close']), historical=True
                 )
+                prev_day_close = float(cd['close'])
+                prev_day_key   = day
             # Always reset both live-forming bars after bootstrap.
             # current_3m must be wiped so live counting starts clean from the
             # next full 3m bucket — never carry a history-fed partial candle
@@ -1119,9 +1156,28 @@ class IndexPaperEngine:
             return
 
         # Strategy is evaluated on the *close time* of this 3m candle.
-        # `bucket` is the candle start; add 180s so logs/notes align with the real close (e.g., 14:03 candle closes at 14:06).
         close_bucket = int(bucket + 180)
         self._run_strategy_on_closed_3m_locked(close_bucket, o, h, l, c)
+
+        # ── Detailed candle log (live only) ──────────────────────────────────
+        # Written AFTER strategy runs so position reflects any entry/exit
+        # that just happened on this candle.
+        try:
+            orb_h, orb_l, _ = self._effective_orb_state_locked()
+            _append_to_candle_log(
+                inst_name   = self.instrument.get('name', self.instrument.get('key', '')),
+                candle_time = epoch_to_local_str(close_bucket, with_seconds=False),
+                o=o, h=h, l=l, c=c,
+                st_val      = self.st.value,
+                st_dir      = self.st.dir,
+                atr         = self.st.atr,
+                orb_h       = orb_h,
+                orb_l       = orb_l,
+                position    = self.position,
+                note        = self.last_strategy_note,
+            )
+        except Exception:
+            pass
 
 
     def _refresh_option_chain_locked(self, force: bool = False) -> bool:
@@ -1139,14 +1195,29 @@ class IndexPaperEngine:
         if not self.option_chain_map:
             return None
         desired = self._atm_strike(price)
+        step    = int(self.instrument.get('strike_step', 50))
+
+        # Build sorted candidate list by proximity to ATM
         candidates = []
         for (strike, s), snap in self.option_chain_map.items():
             if s != side:
                 continue
+            prem = float(snap.get('premium', 0))
+            if prem <= 0:
+                continue  # Skip zero-premium strikes entirely
             candidates.append((abs(int(strike) - int(desired)), int(strike), snap))
         if not candidates:
             return None
         candidates.sort(key=lambda x: (x[0], x[1]))
+
+        # Walk candidates until we find one with a sensible premium (>= 5)
+        # This prevents picking a deep OTM strike with ₹0.35 premium
+        MIN_PREMIUM = 5.0
+        for _, _, snap in candidates:
+            if float(snap.get('premium', 0)) >= MIN_PREMIUM:
+                return dict(snap)
+
+        # All candidates below min — return closest anyway (e.g. far expiry, illiquid)
         return dict(candidates[0][2])
 
     def prefetch_option_chain(self):
@@ -1420,7 +1491,9 @@ class IndexPaperEngine:
         self.entry_option_price = float(snap['premium'])
         self.current_option_price = float(snap['premium'])
         self.entry_option_security_id = str(snap['security_id'])
-        self.entry_lot_size = int(snap['lot_size'])
+        # Always use default_lot_size from INSTRUMENTS dict — never trust the
+        # option chain API's lot_size field which is often stale or wrong.
+        self.entry_lot_size = int(self.instrument.get('default_lot_size', snap.get('lot_size', 1)))
         self.entry_expiry = snap.get('expiry')
         self.last_option_tick_wc = 0.0  # reset so fallback polling activates until first WS tick arrives
         self.option_tick_count = 0
@@ -1880,6 +1953,37 @@ def _append_to_trade_log(trade_line: str, inst_name: str) -> None:
             if write_header:
                 f.write('time,instrument,entry\n')
             f.write(f"{ts},{inst_name},{trade_line}\n")
+    except Exception:
+        pass
+
+def _append_to_candle_log(inst_name: str, candle_time: str,
+                           o: float, h: float, l: float, c: float,
+                           st_val: Optional[float], st_dir: Optional[int],
+                           atr: Optional[float],
+                           orb_h: Optional[float], orb_l: Optional[float],
+                           position: Optional[str], note: str) -> None:
+    """Append one 3m candle + ST state to today's candle log CSV."""
+    try:
+        log_file = _today_log_dir() / 'candles.csv'
+        write_header = not log_file.exists()
+        trend = ('UP' if st_dir == 1 else 'DOWN') if st_dir is not None else ''
+        with open(log_file, 'a', encoding='utf-8', newline='') as f:
+            if write_header:
+                f.write('instrument,time,open,high,low,close,'
+                        'st_value,st_direction,atr,'
+                        'orb_high,orb_low,position,note\n')
+            st_s   = f'{st_val:.2f}'  if st_val  is not None else ''
+            atr_s  = f'{atr:.4f}'   if atr     is not None else ''
+            orbh_s = f'{orb_h:.2f}' if orb_h   is not None else ''
+            orbl_s = f'{orb_l:.2f}' if orb_l   is not None else ''
+            f.write(
+                f"{inst_name},{candle_time},"
+                f"{o:.2f},{h:.2f},{l:.2f},{c:.2f},"
+                f"{st_s},{trend},{atr_s},"
+                f"{orbh_s},{orbl_s},"
+                f"{position or ''},"
+                f"{note}\n"
+            )
     except Exception:
         pass
 
