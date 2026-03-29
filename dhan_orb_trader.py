@@ -895,6 +895,7 @@ class IndexPaperEngine:
         self.prev_close: Optional[float] = None
         self.last_ltp: Optional[float] = None
         self.last_ltt_epoch: Optional[int] = None
+        self.last_rest_1m_bucket: int = 0   # tracks last 1m candle fed from REST
         self.last_tick_seen_epoch: Optional[int] = None
 
         self.current_1m: Optional[Dict[str, Any]] = None
@@ -1035,6 +1036,7 @@ class IndexPaperEngine:
             # into live tick counting (it would fire 1 candle too early).
             self.current_1m = None
             self.current_3m = None
+            self.last_rest_1m_bucket = 0
             # if history belonged to a prior day, also reset ORB state
             if self.current_session_date != self._today_key():
                 self.current_session_date = None
@@ -1045,30 +1047,32 @@ class IndexPaperEngine:
                 self.last_strategy_note = 'waiting for market to open'
 
     def on_tick(self, ltp: float, ltt_epoch: int):
+        """WS tick: update LTP for display only.
+        Candle building is done via REST poll in App._rest_1m_poll_loop().
+        """
         ltp = float(ltp)
         ltt_epoch = _normalize_dhan_epoch(int(ltt_epoch))
-        bucket = minute_bucket_epoch(ltt_epoch)
         with self.lock:
             self.last_ltp = ltp
             self.last_ltt_epoch = ltt_epoch
             self.last_tick_seen_epoch = int(time.time())
-            if self.current_1m is None:
-                self.current_1m = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'tick_count': 1}
-                return
-            cur_bucket = int(self.current_1m['bucket'])
-            if bucket == cur_bucket:
-                self.current_1m['high'] = max(float(self.current_1m['high']), ltp)
-                self.current_1m['low'] = min(float(self.current_1m['low']), ltp)
-                self.current_1m['close'] = ltp
-                self.current_1m['tick_count'] = int(self.current_1m.get('tick_count', 0)) + 1
-                return
-            if bucket > cur_bucket:
-                co = float(self.current_1m['open'])
-                ch = float(self.current_1m['high'])
-                cl = float(self.current_1m['low'])
-                cc = float(self.current_1m['close'])
-                self._ingest_completed_1m_locked(cur_bucket, co, ch, cl, cc, historical=False)
-                self.current_1m = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'tick_count': 1}
+
+    def ingest_rest_1m_candle(self, bucket: int, o: float, h: float, l: float, c: float) -> bool:
+        """Feed one completed 1m candle from REST API.
+        Returns True if candle was new and fed into the engine, False if duplicate.
+        Called from App._rest_1m_poll_loop() — NOT from WS thread.
+        """
+        bucket = int(bucket)
+        with self.lock:
+            if bucket <= self.last_rest_1m_bucket:
+                return False   # duplicate or out-of-order
+            self.last_rest_1m_bucket = bucket
+            # Also update last_ltp from candle close so dashboard shows value
+            # even when WS ltp hasn't arrived yet
+            if self.last_ltp is None:
+                self.last_ltp = float(c)
+            self._ingest_completed_1m_locked(bucket, float(o), float(h), float(l), float(c), historical=False)
+            return True
 
     def on_option_tick(self, option_sec: str, premium: float, ltt_epoch: int):
         premium = float(premium)
@@ -1879,6 +1883,104 @@ class App:
         except Exception:
             pass
 
+    def _fetch_latest_1m_candle(self, inst: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Fetch just the last completed 1m candle for one instrument via REST.
+        Returns dict with bucket/open/high/low/close or None on failure.
+        """
+        try:
+            now   = now_local()
+            # fromDate = 5 minutes ago so we only pull a tiny slice (not 90 days)
+            from_dt = now - timedelta(minutes=5)
+            url = 'https://api.dhan.co/v2/charts/intraday'
+            headers = {
+                'Content-Type': 'application/json',
+                'access-token': DHAN_ACCESS_TOKEN,
+                'client-id':    DHAN_CLIENT_ID,
+            }
+            payload = {
+                'securityId':      str(inst['security_id']),
+                'exchangeSegment': str(inst['exchange']),
+                'instrument':      str(inst.get('instrument_type', 'INDEX')),
+                'interval':        '1',
+                'oi':              False,
+                'fromDate':        from_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                'toDate':          now.strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=10)
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            ts = data.get('timestamp') or []
+            o  = data.get('open')  or []
+            h  = data.get('high')  or []
+            l  = data.get('low')   or []
+            c  = data.get('close') or []
+            n  = min(len(ts), len(o), len(h), len(l), len(c))
+            if n == 0:
+                return None
+            # Current running minute — drop it, we only want completed candles
+            current_minute_bucket = (int(time.time()) // 60) * 60
+            candles = []
+            for i in range(n):
+                b = int(ts[i])
+                if b < current_minute_bucket:
+                    candles.append({'bucket': b, 'open': float(o[i]), 'high': float(h[i]),
+                                    'low': float(l[i]), 'close': float(c[i])})
+            if not candles:
+                return None
+            return candles[-1]   # last completed 1m candle
+        except Exception:
+            return None
+
+    def _rest_1m_poll_loop(self):
+        """Background thread: wakes up ~5s after each minute closes, fetches
+        the completed 1m candle for every instrument via REST, feeds into engine.
+
+        Rate limit: Dhan intraday historical has NO per-second rate limit.
+        Daily limit: 1,00,000 requests/day.
+        With 26 instruments × ~6.5 hours × 60 min = ~10,140 calls/day — very safe.
+        We stagger calls 0.1s apart = max 10 req/sec — well within limits.
+        """
+        while not self.stop_evt.is_set():
+            now_ts   = time.time()
+            # Next minute boundary + 5s buffer for Dhan to publish the candle
+            next_wake = ((now_ts // 60) + 1) * 60 + 5.0
+            sleep_for = next_wake - now_ts
+            if sleep_for > 0:
+                # Sleep in small chunks so stop_evt is respected quickly
+                chunks = int(sleep_for / 0.5)
+                for _ in range(chunks):
+                    if self.stop_evt.is_set():
+                        return
+                    time.sleep(0.5)
+                remainder = next_wake - time.time()
+                if remainder > 0:
+                    time.sleep(remainder)
+
+            if self.stop_evt.is_set():
+                return
+
+            # Fetch for each instrument, staggered 0.1s apart
+            for inst in self.selected:
+                if self.stop_evt.is_set():
+                    break
+                key = _engine_key(inst['security_id'], inst['exchange'])
+                eng = self.engines.get(key)
+                if eng is None:
+                    continue
+                candle = self._fetch_latest_1m_candle(inst)
+                if candle:
+                    fed = eng.ingest_rest_1m_candle(
+                        candle['bucket'], candle['open'],
+                        candle['high'], candle['low'], candle['close'])
+                    if fed:
+                        _append_to_day_log(
+                            f"REST 1m | {inst['name']:<20} "
+                            f"[{epoch_to_local_str(candle['bucket'], False)}] "
+                            f"O:{candle['open']:.2f} H:{candle['high']:.2f} "
+                            f"L:{candle['low']:.2f} C:{candle['close']:.2f}")
+                time.sleep(0.1)   # 0.1s stagger between instruments
+
     def process_option_subscriptions(self):
         """Subscribe to option security IDs requested by engines."""
         pending: List[Dict[str,str]] = []
@@ -2533,6 +2635,9 @@ class MainWindow(ctk.CTk):
                 # Start background option polling thread (off main tkinter thread)
                 bg=threading.Thread(target=self._start_bg_loop, daemon=True)
                 bg.start()
+                # Start REST 1m candle poller (replaces WS tick candle building)
+                rest_t=threading.Thread(target=app._rest_1m_poll_loop, daemon=True)
+                rest_t.start()
             except Exception as e:
                 msg=str(e)
                 self._running=False
