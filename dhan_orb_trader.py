@@ -896,6 +896,7 @@ class IndexPaperEngine:
         self.last_ltp: Optional[float] = None
         self.last_ltt_epoch: Optional[int] = None
         self.last_rest_1m_bucket: int = 0   # tracks last 1m candle fed from REST
+        self.last_strategy_3m_bucket: int = 0  # tracks last 3m candle strategy was run on
         self.last_tick_seen_epoch: Optional[int] = None
 
         self.current_1m: Optional[Dict[str, Any]] = None
@@ -1037,6 +1038,7 @@ class IndexPaperEngine:
             self.current_1m = None
             self.current_3m = None
             self.last_rest_1m_bucket = 0
+            self.last_strategy_3m_bucket = 0
             # if history belonged to a prior day, also reset ORB state
             if self.current_session_date != self._today_key():
                 self.current_session_date = None
@@ -2033,6 +2035,66 @@ class App:
         _append_to_day_log(
             f"ST rebuild | {inst['name']:<20} "
             f"ST={st_str} dir={dir_str} ATR={atr_str} bars3m={len(candles_3m)}")
+
+        # ── Run strategy on any newly completed 3m candles ───────────────────
+        # This replaces the old _finalize_3m_locked trigger path.
+        # We find candles that closed after last_strategy_3m_bucket and
+        # evaluate strategy on each in order.
+        with eng.lock:
+            last_eval = eng.last_strategy_3m_bucket
+            # Only market-hours candles from today are strategy-relevant
+            new_candles = [
+                cd for cd in candles_3m
+                if int(cd['bucket']) > last_eval
+                and is_market_time(epoch_to_local_dt(int(cd['bucket'])), inst.get('exchange', 'NSE_EQ'))
+            ]
+            for cd in new_candles:
+                bucket     = int(cd['bucket'])
+                close_bucket = bucket + 180   # strategy uses candle close time
+                o = float(cd['open']); h = float(cd['high'])
+                l = float(cd['low']);  c = float(cd['close'])
+
+                # ORB construction (09:18 and 09:21 start buckets)
+                dt = epoch_to_local_dt(bucket)
+                hm = dt.hour * 60 + dt.minute
+                day_key = dt.strftime('%Y-%m-%d')
+                if eng.current_session_date != day_key:
+                    eng._reset_daily_orb_locked(day_key)
+
+                if hm in (9 * 60 + 18, 9 * 60 + 21):
+                    eng.orb_high = h if eng.orb_high is None else max(float(eng.orb_high), h)
+                    eng.orb_low  = l if eng.orb_low  is None else min(float(eng.orb_low),  l)
+                    eng.orb_bars_count += 1
+                    if eng.orb_bars_count >= 2:
+                        eng.orb_ready = True
+                        eng.last_strategy_note = f'ORB ready H={eng.orb_high:.2f} L={eng.orb_low:.2f}'
+                    else:
+                        eng.last_strategy_note = 'waiting for ORB levels'
+                    eng.last_strategy_3m_bucket = bucket
+                    continue
+
+                # Run strategy on this closed 3m candle
+                eng._run_strategy_on_closed_3m_locked(close_bucket, o, h, l, c)
+
+                # Candle log
+                try:
+                    orb_h2, orb_l2, _ = eng._effective_orb_state_locked()
+                    _append_to_candle_log(
+                        inst_name   = inst.get('name', inst.get('key', '')),
+                        candle_time = epoch_to_local_str(close_bucket, with_seconds=False),
+                        o=o, h=h, l=l, c=c,
+                        st_val  = eng.st.value,
+                        st_dir  = eng.st.dir,
+                        atr     = eng.st.atr,
+                        orb_h   = orb_h2,
+                        orb_l   = orb_l2,
+                        position = eng.position,
+                        note    = eng.last_strategy_note,
+                    )
+                except Exception:
+                    pass
+
+                eng.last_strategy_3m_bucket = bucket
 
     def _rest_1m_poll_loop(self):
         """Background thread: wakes 5s after each minute closes, fetches full
