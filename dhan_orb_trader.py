@@ -1883,15 +1883,14 @@ class App:
         except Exception:
             pass
 
-    def _fetch_latest_1m_candle(self, inst: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Fetch just the last completed 1m candle for one instrument via REST.
-        Returns dict with bucket/open/high/low/close or None on failure.
+    def _fetch_1m_candles_for_inst(self, inst: Dict[str, Any], lookback_days: int) -> List[Dict[str, Any]]:
+        """Fetch lookback_days of 1m OHLC for one instrument via REST.
+        Drops the current incomplete minute candle.
+        Identical approach to live_supertrend_scanner_dhan.py.
         """
         try:
-            now   = now_local()
-            # fromDate = 5 minutes ago so we only pull a tiny slice (not 90 days)
-            from_dt = now - timedelta(minutes=5)
-            url = 'https://api.dhan.co/v2/charts/intraday'
+            now     = now_local()
+            from_dt = now - timedelta(days=max(1, lookback_days))
             headers = {
                 'Content-Type': 'application/json',
                 'access-token': DHAN_ACCESS_TOKEN,
@@ -1906,80 +1905,173 @@ class App:
                 'fromDate':        from_dt.strftime('%Y-%m-%d %H:%M:%S'),
                 'toDate':          now.strftime('%Y-%m-%d %H:%M:%S'),
             }
-            r = requests.post(url, headers=headers, json=payload, timeout=10)
+            r = requests.post(
+                'https://api.dhan.co/v2/charts/intraday',
+                headers=headers, json=payload, timeout=20)
             if r.status_code != 200:
-                return None
+                return []
             data = r.json()
             ts = data.get('timestamp') or []
             o  = data.get('open')  or []
             h  = data.get('high')  or []
             l  = data.get('low')   or []
             c  = data.get('close') or []
+            v  = data.get('volume') or []
             n  = min(len(ts), len(o), len(h), len(l), len(c))
-            if n == 0:
-                return None
-            # Current running minute — drop it, we only want completed candles
-            current_minute_bucket = (int(time.time()) // 60) * 60
-            candles = []
+            out = []
             for i in range(n):
-                b = int(ts[i])
-                if b < current_minute_bucket:
-                    candles.append({'bucket': b, 'open': float(o[i]), 'high': float(h[i]),
-                                    'low': float(l[i]), 'close': float(c[i])})
-            if not candles:
-                return None
-            return candles[-1]   # last completed 1m candle
+                out.append({
+                    'bucket': int(ts[i]),
+                    'open':   float(o[i]),
+                    'high':   float(h[i]),
+                    'low':    float(l[i]),
+                    'close':  float(c[i]),
+                    'volume': float(v[i]) if i < len(v) else 0.0,
+                })
+            out.sort(key=lambda x: x['bucket'])
+            # Drop current incomplete minute (scanner approach)
+            if out:
+                cur_min = (int(time.time()) // 60) * 60
+                if int(out[-1]['bucket']) >= cur_min:
+                    out = out[:-1]
+            return out
         except Exception:
-            return None
+            return []
+
+    @staticmethod
+    def _aggregate_1m_to_3m(candles_1m: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Aggregate 1m → 3m. Drops incomplete current 3m window.
+        Exact same logic as scanner's aggregate_1m_to_tf (FIX 3).
+        """
+        tf_sec = 3 * 60
+        out: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+        cur_bucket: Optional[int] = None
+
+        for c in candles_1m:
+            b         = int(c['bucket'])
+            tf_bucket = int(b // tf_sec * tf_sec)
+            if current is None or tf_bucket != cur_bucket:
+                if current is not None:
+                    out.append(current)
+                cur_bucket = tf_bucket
+                current = {
+                    'bucket': tf_bucket,
+                    'open':   float(c['open']),
+                    'high':   float(c['high']),
+                    'low':    float(c['low']),
+                    'close':  float(c['close']),
+                    'volume': float(c.get('volume', 0.0)),
+                }
+            else:
+                current['high']   = max(current['high'],  float(c['high']))
+                current['low']    = min(current['low'],   float(c['low']))
+                current['close']  = float(c['close'])
+                current['volume'] += float(c.get('volume', 0.0))
+
+        if current is not None:
+            out.append(current)
+
+        # Drop incomplete current 3m window (scanner FIX 3)
+        if out:
+            cur_tf = (int(time.time()) // tf_sec) * tf_sec
+            if int(out[-1]['bucket']) >= cur_tf:
+                out = out[:-1]
+
+        return out
+
+    def _rebuild_st_from_rest(self, inst: Dict[str, Any], candles_1m: List[Dict[str, Any]]) -> None:
+        """Rebuild Supertrend completely from scratch from REST 1m candles.
+        Exact approach from live_supertrend_scanner_dhan.py (rebuild_runtime_from_official):
+          fetch full history → aggregate to 3m → rebuild ST engine from bar 0.
+
+        Full history depth on every refresh = consistent SMA seed = no ST drift.
+        (Scanner's FIX 1: using short lookback caused different seed each reload.)
+        """
+        if not candles_1m:
+            return
+        key = _engine_key(inst['security_id'], inst['exchange'])
+        eng = self.engines.get(key)
+        if eng is None:
+            return
+
+        candles_3m = self._aggregate_1m_to_3m(candles_1m)
+        if not candles_3m:
+            return
+
+        # Rebuild ST from scratch (scanner's rebuild_runtime_from_official)
+        new_st           = SupertrendState(ST_ATR_LEN, ST_FACTOR)
+        prev_day_close: Optional[float] = None
+        prev_day_key:   Optional[str]   = None
+
+        for cd in candles_3m:
+            dt  = epoch_to_local_dt(int(cd['bucket']))
+            day = dt.strftime('%Y-%m-%d')
+            # Seed prev_close across day boundaries
+            if prev_day_key is not None and day != prev_day_key and prev_day_close is not None:
+                new_st.prev_close = prev_day_close
+            # Only feed market-hours candles
+            if is_market_time(dt, inst.get('exchange', 'NSE_EQ')):
+                new_st.update(float(cd['open']), float(cd['high']),
+                              float(cd['low']),  float(cd['close']))
+            prev_day_close = float(cd['close'])
+            prev_day_key   = day
+
+        # Atomically update engine's ST — leave ORB/position/trade state untouched
+        with eng.lock:
+            eng.st = new_st
+            # Update completed_3m for dashboard candle history display
+            from collections import deque as _deque
+            eng.completed_3m = _deque(
+                [{'bucket': c['bucket'], 'open': c['open'], 'high': c['high'],
+                  'low': c['low'], 'close': c['close']} for c in candles_3m[-40:]],
+                maxlen=40)
+
+        st_str  = f"{new_st.value:.2f}" if new_st.value  is not None else 'N/A'
+        dir_str = 'UP' if new_st.dir == 1 else ('DOWN' if new_st.dir == -1 else '-')
+        atr_str = f"{new_st.atr:.4f}"  if new_st.atr    is not None else 'N/A'
+        _append_to_day_log(
+            f"ST rebuild | {inst['name']:<20} "
+            f"ST={st_str} dir={dir_str} ATR={atr_str} bars3m={len(candles_3m)}")
 
     def _rest_1m_poll_loop(self):
-        """Background thread: wakes up ~5s after each minute closes, fetches
-        the completed 1m candle for every instrument via REST, feeds into engine.
+        """Background thread: wakes 5s after each minute closes, fetches full
+        1m history for every instrument, rebuilds ST completely from scratch.
 
-        Rate limit: Dhan intraday historical has NO per-second rate limit.
-        Daily limit: 1,00,000 requests/day.
-        With 26 instruments × ~6.5 hours × 60 min = ~10,140 calls/day — very safe.
-        We stagger calls 0.1s apart = max 10 req/sec — well within limits.
+        Matches live_supertrend_scanner_dhan.py exactly:
+        - Full lookback every refresh → consistent SMA seed → no ST drift (FIX 1)
+        - Rebuild from scratch → no accumulated incremental errors
+        - WS ticks = LTP display only
+
+        Rate limits (official Dhan docs):
+        - Intraday minute TF: NO per-second rate limit
+        - Daily limit: 1,00,000 requests/day
+        - Our usage: 26 instr × 60/hr × 6.5 hr = ~10,140 calls/day ✅
+        - Stagger 0.15s = ~3.9s per full cycle ✅
         """
+        REFRESH_DAYS = min(5, BOOTSTRAP_LOOKBACK_DAYS)  # same as scanner SEED_LOOKBACK_DAYS
+
         while not self.stop_evt.is_set():
-            now_ts   = time.time()
-            # Next minute boundary + 5s buffer for Dhan to publish the candle
+            now_ts    = time.time()
             next_wake = ((now_ts // 60) + 1) * 60 + 5.0
             sleep_for = next_wake - now_ts
             if sleep_for > 0:
-                # Sleep in small chunks so stop_evt is respected quickly
-                chunks = int(sleep_for / 0.5)
-                for _ in range(chunks):
+                end = time.time() + sleep_for
+                while time.time() < end:
                     if self.stop_evt.is_set():
                         return
                     time.sleep(0.5)
-                remainder = next_wake - time.time()
-                if remainder > 0:
-                    time.sleep(remainder)
 
             if self.stop_evt.is_set():
                 return
 
-            # Fetch for each instrument, staggered 0.1s apart
             for inst in self.selected:
                 if self.stop_evt.is_set():
                     break
-                key = _engine_key(inst['security_id'], inst['exchange'])
-                eng = self.engines.get(key)
-                if eng is None:
-                    continue
-                candle = self._fetch_latest_1m_candle(inst)
-                if candle:
-                    fed = eng.ingest_rest_1m_candle(
-                        candle['bucket'], candle['open'],
-                        candle['high'], candle['low'], candle['close'])
-                    if fed:
-                        _append_to_day_log(
-                            f"REST 1m | {inst['name']:<20} "
-                            f"[{epoch_to_local_str(candle['bucket'], False)}] "
-                            f"O:{candle['open']:.2f} H:{candle['high']:.2f} "
-                            f"L:{candle['low']:.2f} C:{candle['close']:.2f}")
-                time.sleep(0.1)   # 0.1s stagger between instruments
+                candles_1m = self._fetch_1m_candles_for_inst(inst, REFRESH_DAYS)
+                if candles_1m:
+                    self._rebuild_st_from_rest(inst, candles_1m)
+                time.sleep(0.15)   # stagger between instruments
 
     def process_option_subscriptions(self):
         """Subscribe to option security IDs requested by engines."""
