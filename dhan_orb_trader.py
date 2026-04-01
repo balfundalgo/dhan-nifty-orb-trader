@@ -67,7 +67,7 @@ WS_URL = (
 #            TATAELXSI | POLYCAB
 #   Groups : ALL_INDEX  (NIFTY + BANKNIFTY + SENSEX + FINNIFTY + MIDCPNIFTY)
 #            ALL_STOCKS (all 20 stocks)
-#            COMMODITY  (CRUDEOILM)
+#            COMMODITY  (none currently)
 #            ALL        (ALL_INDEX + ALL_STOCKS + COMMODITY)
 TRADE_MODE = os.getenv('TRADE_MODE', 'NIFTY').strip().upper()
 ST_ATR_LEN = 10
@@ -216,17 +216,7 @@ INSTRUMENTS = {
         'default_lot_size': int(os.getenv('MCX_LOT_SIZE', '625')),
         'lots': int(os.getenv('MCX_LOTS', '1')),
     },
-    'CRUDEOILM': {
-        # MCX Mini Crude Oil futures — security_id resolved at runtime from scrip master
-        # Correct exchange segment string for MCX is 'MCX_COMM' (double M)
-        'key': 'CRUDEOILM', 'name': 'CRUDE OIL MINI', 'mcx_symbol': 'CRUDEOILM',
-        'exchange': 'MCX_COMM', 'security_id': '0',
-        'instrument_type': 'FUTCOM',
-        'display_prec': 2, 'strike_step': 100, 'option_prefix': 'CRUDEOILM',
-        'fno_exchange': 'MCX_COMM',
-        'default_lot_size': int(os.getenv('CRUDEOILM_LOT_SIZE', '10')),
-        'lots': int(os.getenv('CRUDEOILM_LOTS', '1')),
-    },
+
     'ADANIENT': {
         'key': 'ADANIENT', 'name': 'ADANI ENT', 'nse_symbol': 'ADANIENT',
         'exchange': 'NSE_EQ', 'security_id': '25',
@@ -345,7 +335,7 @@ TRADE_MODE_GROUPS: Dict[str, List[str]] = {
                    'PERSISTENT', 'OFSS', 'INDIGO', 'TVSMOTOR', 'ULTRACEMCO',
                    'BRITANNIA', 'APOLLOHOSP', 'RELIANCE', 'TATAELXSI', 'POLYCAB'],
 }
-TRADE_MODE_GROUPS['COMMODITY'] = ['CRUDEOILM']
+TRADE_MODE_GROUPS['COMMODITY'] = []  # reserved for future commodity instruments
 TRADE_MODE_GROUPS['ALL'] = TRADE_MODE_GROUPS['ALL_INDEX'] + TRADE_MODE_GROUPS['ALL_STOCKS'] + TRADE_MODE_GROUPS['COMMODITY']
 
 
@@ -1510,11 +1500,28 @@ class IndexPaperEngine:
         }
         self._log_trade_locked('ENTER', side, self.entry_strike, price, bucket, f"{reason} | {self.instrument['option_prefix']} {side} @ {self.entry_option_price:.2f}")
 
+    def force_squareoff(self, reason: str = 'manual squareoff') -> bool:
+        """Immediately exit active position at last known LTP. Returns True if position was closed."""
+        with self.lock:
+            if self.position is None:
+                return False
+            price = self.last_ltp or self.entry_price or 0.0
+            bucket = int(time.time())
+            self._exit_locked(float(price), bucket, reason)
+            return True
+
     def _run_strategy_on_closed_3m_locked(self, bucket: int, o: float, h: float, l: float, c: float):
         dt = epoch_to_local_dt(bucket)
         hm = dt.hour * 60 + dt.minute
         st_val = self.st.value
         st_dir = self.st.dir
+
+        # Auto square-off at configured time (default 15:15)
+        sq_hm = safe_int(os.getenv('SQUAREOFF_HM', str(15 * 60 + 15)), 15 * 60 + 15)
+        if hm >= sq_hm and self.position is not None:
+            self._exit_locked(c, bucket, f'auto squareoff at {sq_hm//60:02d}:{sq_hm%60:02d}')
+            self.last_strategy_note = f'squared off at {sq_hm//60:02d}:{sq_hm%60:02d}'
+            return
 
         # exits first — rules depend on market phase
         if hm < 10 * 60:
@@ -2135,6 +2142,16 @@ class App:
                     self._rebuild_st_from_rest(inst, candles_1m)
                 time.sleep(0.15)   # stagger between instruments
 
+    def squareoff_all(self, reason: str = 'manual squareoff') -> int:
+        """Square off all active positions. Returns count of positions closed."""
+        count = 0
+        for inst in self.selected:
+            key = _engine_key(inst['security_id'], inst['exchange'])
+            eng = self.engines.get(key)
+            if eng and eng.force_squareoff(reason):
+                count += 1
+        return count
+
     def process_option_subscriptions(self):
         """Subscribe to option security IDs requested by engines."""
         pending: List[Dict[str,str]] = []
@@ -2381,8 +2398,10 @@ class MainWindow(ctk.CTk):
         # page frames
         self.page_creds   = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
         self.page_trading = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        self.page_settings  = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
         self._build_creds_page()
         self._build_trading_page()
+        self._build_settings_page()
         self._build_statusbar()
         self._show_page('credentials' if not _creds_ok() else 'trading')
         self.protocol('WM_DELETE_WINDOW', self._on_close)
@@ -2403,7 +2422,7 @@ class MainWindow(ctk.CTk):
 
         # page switcher
         self.page_seg=ctk.CTkSegmentedButton(bar,
-            values=['⚙  Credentials','📊  Live Trading'],
+            values=['⚙  Credentials','📊  Live Trading','⚙  Settings'],
             font=ctk.CTkFont(MONO,12),
             fg_color=DARK, selected_color=ACCENT, selected_hover_color='#79c0ff',
             unselected_color=DARK, unselected_hover_color=BORDER,
@@ -2411,35 +2430,56 @@ class MainWindow(ctk.CTk):
             command=self._on_page_switch)
         self.page_seg.pack(side='left', padx=20, pady=10)
 
-        # start/stop (right side)
-        self.btn_start=ctk.CTkButton(bar, text='▶  START', width=130,
+        # right side buttons
+        self.btn_start=ctk.CTkButton(bar, text='▶  START', width=120,
             font=ctk.CTkFont(MONO,13,'bold'),
             fg_color=GREEN, text_color=BG, hover_color='#56d364',
             command=self._toggle)
-        self.btn_start.pack(side='right', padx=8, pady=9)
+        self.btn_start.pack(side='right', padx=6, pady=9)
+
+        self.btn_sqoff=ctk.CTkButton(bar, text='⏹ SQ OFF ALL', width=130,
+            font=ctk.CTkFont(MONO,12,'bold'),
+            fg_color='#b91c1c', text_color=WHITE, hover_color='#dc2626',
+            command=self._squareoff_all)
+        self.btn_sqoff.pack(side='right', padx=4, pady=9)
 
         all_modes=list(INSTRUMENTS.keys())+list(TRADE_MODE_GROUPS.keys())
         self.mode_var=ctk.StringVar(value=os.getenv('TRADE_MODE','NIFTY'))
         ctk.CTkOptionMenu(bar, values=all_modes, variable=self.mode_var,
-            width=180, font=ctk.CTkFont(MONO,12),
+            width=160, font=ctk.CTkFont(MONO,12),
             fg_color=DARK, button_color=BORDER,
             dropdown_fg_color=PANEL, text_color=WHITE).pack(side='right', padx=4, pady=9)
         ctk.CTkLabel(bar, text='MODE:', font=ctk.CTkFont(MONO,11),
             text_color=MUTED).pack(side='right', padx=(8,0))
 
     def _on_page_switch(self, val):
-        if 'Credentials' in val: self._show_page('credentials')
-        else:                      self._show_page('trading')
+        if 'Credentials' in val:  self._show_page('credentials')
+        elif 'Settings'  in val:  self._show_page('settings')
+        else:                     self._show_page('trading')
 
     def _show_page(self, name):
         self.page_creds.pack_forget()
         self.page_trading.pack_forget()
+        self.page_settings.pack_forget()
         if name=='credentials':
             self.page_creds.pack(fill='both', expand=True)
             self.page_seg.set('⚙  Credentials')
+        elif name=='settings':
+            self.page_settings.pack(fill='both', expand=True)
+            self.page_seg.set('⚙  Settings')
         else:
             self.page_trading.pack(fill='both', expand=True)
             self.page_seg.set('📊  Live Trading')
+
+    def _squareoff_all(self):
+        if not self._app or not self._running:
+            mb.showinfo('Not Running', 'Strategy is not running.'); return
+        import tkinter.messagebox as _mb
+        msg = 'This will immediately exit ALL active positions at current LTP.\n\nAre you sure?'
+        if not _mb.askyesno('Square Off All', msg):
+            return
+        count = self._app.squareoff_all('manual squareoff')
+        mb.showinfo('Done', f'Squared off {count} position(s).')
 
     # ══════════════════════════════════════════════════════════════════════════
     #  CREDENTIALS PAGE
@@ -2681,6 +2721,123 @@ class MainWindow(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════════
     #  LIVE TRADING PAGE
     # ══════════════════════════════════════════════════════════════════════════
+    def _build_settings_page(self):
+        p = self.page_settings
+        scroll = ctk.CTkScrollableFrame(p, fg_color=BG, corner_radius=0)
+        scroll.pack(fill='both', expand=True)
+
+        ctk.CTkLabel(scroll, text='Strategy Settings',
+            font=ctk.CTkFont(MONO,18,'bold'), text_color=ACCENT).pack(pady=(24,4))
+        ctk.CTkLabel(scroll, text='Changes take effect on next strategy start',
+            font=ctk.CTkFont(MONO,11), text_color=MUTED).pack(pady=(0,16))
+
+        # ── Auto Square Off Time ──────────────────────────────────────────────
+        sq_frm = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=10)
+        sq_frm.pack(fill='x', padx=24, pady=(0,12))
+        ctk.CTkLabel(sq_frm, text='Auto Square Off Time (HH:MM)',
+            font=ctk.CTkFont(MONO,13,'bold'), text_color=WHITE, anchor='w').pack(
+            fill='x', padx=14, pady=(10,2))
+        ctk.CTkLabel(sq_frm, text='All active trades will be squared off at this time every day',
+            font=ctk.CTkFont(MONO,10), text_color=MUTED, anchor='w').pack(fill='x', padx=14)
+
+        sq_row = ctk.CTkFrame(sq_frm, fg_color='transparent')
+        sq_row.pack(fill='x', padx=14, pady=8)
+        saved_hm = safe_int(os.getenv('SQUAREOFF_HM', str(15*60+15)), 15*60+15)
+        saved_hh = saved_hm // 60; saved_mm = saved_hm % 60
+        self.e_sq_hh = ctk.CTkEntry(sq_row, width=60, font=ctk.CTkFont(MONO,13),
+            fg_color=DARK, border_color=BORDER, text_color=WHITE, justify='center')
+        self.e_sq_hh.insert(0, f'{saved_hh:02d}')
+        self.e_sq_hh.pack(side='left')
+        ctk.CTkLabel(sq_row, text=':', font=ctk.CTkFont(MONO,16,'bold'),
+            text_color=WHITE).pack(side='left', padx=4)
+        self.e_sq_mm = ctk.CTkEntry(sq_row, width=60, font=ctk.CTkFont(MONO,13),
+            fg_color=DARK, border_color=BORDER, text_color=WHITE, justify='center')
+        self.e_sq_mm.insert(0, f'{saved_mm:02d}')
+        self.e_sq_mm.pack(side='left')
+        self.lbl_sq_status = ctk.CTkLabel(sq_row, text='',
+            font=ctk.CTkFont(MONO,11), text_color=MUTED)
+        self.lbl_sq_status.pack(side='left', padx=10)
+
+        ctk.CTkButton(sq_frm, text='Save Squareoff Time', width=200,
+            font=ctk.CTkFont(MONO,12,'bold'), fg_color=ACCENT, text_color=BG,
+            command=self._save_squareoff_time).pack(padx=14, pady=(0,10))
+
+        # ── Lot Sizes ─────────────────────────────────────────────────────────
+        ctk.CTkLabel(scroll, text='Lot Sizes per Instrument',
+            font=ctk.CTkFont(MONO,13,'bold'), text_color=WHITE).pack(
+            anchor='w', padx=28, pady=(8,4))
+        ctk.CTkLabel(scroll,
+            text='Number of lots to trade (1 = 1 standard lot as per Dhan API). Changes apply on next start.',
+            font=ctk.CTkFont(MONO,10), text_color=MUTED).pack(anchor='w', padx=28, pady=(0,6))
+
+        lot_frm = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=10)
+        lot_frm.pack(fill='x', padx=24, pady=(0,8))
+
+        self._lot_entries: dict = {}
+        cols_per_row = 4
+        grid = ctk.CTkFrame(lot_frm, fg_color='transparent')
+        grid.pack(fill='x', padx=10, pady=10)
+
+        instruments_list = [k for k in INSTRUMENTS.keys()]
+        for idx, key in enumerate(instruments_list):
+            inst = INSTRUMENTS[key]
+            row_idx = idx // cols_per_row
+            col_idx = idx % cols_per_row
+            cell = ctk.CTkFrame(grid, fg_color=DARK, corner_radius=6)
+            cell.grid(row=row_idx, column=col_idx, padx=4, pady=4, sticky='ew')
+            grid.grid_columnconfigure(col_idx, weight=1)
+            ctk.CTkLabel(cell, text=inst['name'][:16],
+                font=ctk.CTkFont(MONO,10), text_color=MUTED, anchor='w').pack(
+                fill='x', padx=6, pady=(4,0))
+            ctk.CTkLabel(cell, text=f"1 lot = {inst['default_lot_size']} qty",
+                font=ctk.CTkFont(MONO,9), text_color=MUTED, anchor='w').pack(
+                fill='x', padx=6)
+            e = ctk.CTkEntry(cell, width=70, font=ctk.CTkFont(MONO,12),
+                fg_color=PANEL, border_color=BORDER, text_color=WHITE, justify='center')
+            cur_lots = safe_int(os.getenv(f'{key}_LOTS', str(inst.get('lots',1))), 1)
+            e.insert(0, str(cur_lots))
+            e.pack(padx=6, pady=(2,6))
+            self._lot_entries[key] = e
+
+        ctk.CTkButton(scroll, text='💾  Save All Lot Sizes', width=220,
+            font=ctk.CTkFont(MONO,13,'bold'), fg_color=ACCENT, text_color=BG,
+            command=self._save_lot_sizes).pack(pady=16)
+
+        self.lbl_lots_status = ctk.CTkLabel(scroll, text='',
+            font=ctk.CTkFont(MONO,11), text_color=MUTED)
+        self.lbl_lots_status.pack(pady=(0,20))
+
+    def _save_squareoff_time(self):
+        try:
+            hh = int(self.e_sq_hh.get().strip())
+            mm = int(self.e_sq_mm.get().strip())
+            if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                raise ValueError
+            hm = hh * 60 + mm
+            _save_env(SQUAREOFF_HM=str(hm))
+            self.lbl_sq_status.configure(
+                text=f'✅ Saved: {hh:02d}:{mm:02d}', text_color=GREEN)
+        except Exception:
+            self.lbl_sq_status.configure(
+                text='❌ Invalid time', text_color=RED)
+
+    def _save_lot_sizes(self):
+        kw = {}
+        for key, entry in self._lot_entries.items():
+            try:
+                v = max(1, int(entry.get().strip()))
+                entry.delete(0,'end'); entry.insert(0, str(v))
+                kw[f'{key}_LOTS'] = str(v)
+                # Update live INSTRUMENTS dict so it takes effect immediately
+                INSTRUMENTS[key]['lots'] = v
+            except Exception:
+                self.lbl_lots_status.configure(
+                    text=f'❌ Invalid value for {key}', text_color=RED)
+                return
+        _save_env(**kw)
+        self.lbl_lots_status.configure(
+            text=f'✅ Saved lot sizes for {len(kw)} instruments', text_color=GREEN)
+
     def _build_trading_page(self):
         p=self.page_trading
 
