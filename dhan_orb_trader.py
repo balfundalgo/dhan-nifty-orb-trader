@@ -1022,13 +1022,21 @@ class IndexPaperEngine:
                 prev_day_close = float(cd['close'])
                 prev_day_key   = day
             # Always reset both live-forming bars after bootstrap.
-            # current_3m must be wiped so live counting starts clean from the
-            # next full 3m bucket — never carry a history-fed partial candle
-            # into live tick counting (it would fire 1 candle too early).
             self.current_1m = None
             self.current_3m = None
             self.last_rest_1m_bucket = 0
-            self.last_strategy_3m_bucket = 0
+            # CRITICAL: Set last_strategy_3m_bucket to the LAST candle from history
+            # so the REST poll loop only evaluates NEW live candles — not history.
+            # Without this, every historical candle gets replayed through strategy
+            # on the first REST refresh, causing immediate spurious trades at startup.
+            if candles_1m:
+                # Find the latest 3m bucket from bootstrap candles
+                last_1m_bucket = int(candles_1m[-1].get('time', candles_1m[-1].get('bucket', 0)))
+                tf_sec = 3 * 60
+                last_3m_bucket = int(last_1m_bucket // tf_sec * tf_sec)
+                self.last_strategy_3m_bucket = last_3m_bucket
+            else:
+                self.last_strategy_3m_bucket = 0
             # if history belonged to a prior day, also reset ORB state
             if self.current_session_date != self._today_key():
                 self.current_session_date = None
@@ -2050,9 +2058,11 @@ class App:
         with eng.lock:
             last_eval = eng.last_strategy_3m_bucket
             # Only market-hours candles from today are strategy-relevant
+            today_str = now_local().strftime('%Y-%m-%d')
             new_candles = [
                 cd for cd in candles_3m
                 if int(cd['bucket']) > last_eval
+                and epoch_to_local_dt(int(cd['bucket'])).strftime('%Y-%m-%d') == today_str
                 and is_market_time(epoch_to_local_dt(int(cd['bucket'])), inst.get('exchange', 'NSE_EQ'))
             ]
             for cd in new_candles:
