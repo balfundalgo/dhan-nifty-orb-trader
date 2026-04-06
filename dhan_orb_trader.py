@@ -1029,12 +1029,26 @@ class IndexPaperEngine:
             # so the REST poll loop only evaluates NEW live candles — not history.
             # Without this, every historical candle gets replayed through strategy
             # on the first REST refresh, causing immediate spurious trades at startup.
+            # Set last_strategy_3m_bucket to the last 3m candle from BEFORE today.
+            # This ensures all of today's candles (including the 09:18 and 09:21
+            # ORB candles) are always seen as "new" by the REST poll, regardless
+            # of how long bootstrap took to run.
+            # If we used today's last candle instead, a slow bootstrap (finishing
+            # after 09:18) would set the marker past the ORB candles, causing ORB
+            # to never be built on the first REST poll.
             if candles_1m:
-                # Find the latest 3m bucket from bootstrap candles
-                last_1m_bucket = int(candles_1m[-1].get('time', candles_1m[-1].get('bucket', 0)))
+                today_key_str = self._today_key()
                 tf_sec = 3 * 60
-                last_3m_bucket = int(last_1m_bucket // tf_sec * tf_sec)
-                self.last_strategy_3m_bucket = last_3m_bucket
+                yesterday_last_1m = None
+                for cd in reversed(candles_1m):
+                    b = int(cd.get('time', cd.get('bucket', 0)))
+                    if epoch_to_local_dt(b).strftime('%Y-%m-%d') < today_key_str:
+                        yesterday_last_1m = b
+                        break
+                if yesterday_last_1m is not None:
+                    self.last_strategy_3m_bucket = int(yesterday_last_1m // tf_sec * tf_sec)
+                else:
+                    self.last_strategy_3m_bucket = 0
             else:
                 self.last_strategy_3m_bucket = 0
             # if history belonged to a prior day, also reset ORB state
@@ -1567,6 +1581,10 @@ class IndexPaperEngine:
                 self._enter_locked('PE', c, bucket, 'pre-10 ORB down breakout')
                 return
             self.last_strategy_note = 'pre-10 no breakout'
+            _append_to_session_log(
+                f"{self.instrument['name']:<20} {epoch_to_local_str(bucket,False)}"
+                f" PRE10 no breakout | close={c:.2f}"
+                f" ORB_H={self.orb_high:.2f} ORB_L={self.orb_low:.2f}", 'STRATEGY')
             return
 
         # 10:00 onward => Supertrend only
@@ -1846,6 +1864,20 @@ class App:
         # Rebuild engine map now that security IDs may have changed
         self.engines = {_engine_key(inst['security_id'], inst['exchange']): IndexPaperEngine(inst) for inst in self.selected}
         self.subscribed_secids = set(_engine_key(str(inst['security_id']), inst['exchange']) for inst in self.selected)
+        self.app_start_epoch: int = int(time.time())
+        _append_to_session_log(
+            f'=== SESSION START | mode={os.getenv("TRADE_MODE","?")}'  
+            f' | instruments={len(self.selected)}'  
+            f' | sq_off={safe_int(os.getenv("SQUAREOFF_HM",str(15*60+15)),15*60+15)//60:02d}'
+            f':{safe_int(os.getenv("SQUAREOFF_HM",str(15*60+15)),15*60+15)%60:02d} ===',
+            'SESSION')
+        for inst in self.selected:
+            lots = inst.get('lots', 1)
+            lot_sz = inst.get('default_lot_size', 1)
+            _append_to_session_log(
+                f"  {inst['name']:<24} sid={inst['security_id']:<6}"
+                f" exch={inst['exchange']:<10} lots={lots} x {lot_sz} = {lots*lot_sz} qty",
+                'SESSION')
         if not BOOTSTRAP_HISTORY:
             return
         print('Bootstrapping with recent 1m candles...')
@@ -1997,7 +2029,8 @@ class App:
 
         return out
 
-    def _rebuild_st_from_rest(self, inst: Dict[str, Any], candles_1m: List[Dict[str, Any]]) -> None:
+    def _rebuild_st_from_rest(self, inst: Dict[str, Any], candles_1m: List[Dict[str, Any]],
+                              app_start_epoch: int = 0) -> None:
         """Rebuild Supertrend completely from scratch from REST 1m candles.
         Exact approach from live_supertrend_scanner_dhan.py (rebuild_runtime_from_official):
           fetch full history → aggregate to 3m → rebuild ST engine from bar 0.
@@ -2059,25 +2092,32 @@ class App:
             last_eval = eng.last_strategy_3m_bucket
             # Only market-hours candles from today are strategy-relevant
             today_str = now_local().strftime('%Y-%m-%d')
-            new_candles = [
+            # Candidates: today's candles, not yet evaluated, within market hours.
+            # NO app_start_epoch filter here — ORB candles must always be
+            # processed from history regardless of when we started.
+            # Strategy evaluation is guarded separately below.
+            candidate_candles = [
                 cd for cd in candles_3m
                 if int(cd['bucket']) > last_eval
                 and epoch_to_local_dt(int(cd['bucket'])).strftime('%Y-%m-%d') == today_str
                 and is_market_time(epoch_to_local_dt(int(cd['bucket'])), inst.get('exchange', 'NSE_EQ'))
             ]
-            for cd in new_candles:
-                bucket     = int(cd['bucket'])
-                close_bucket = bucket + 180   # strategy uses candle close time
+            for cd in candidate_candles:
+                bucket       = int(cd['bucket'])
+                close_bucket = bucket + 180
                 o = float(cd['open']); h = float(cd['high'])
                 l = float(cd['low']);  c = float(cd['close'])
 
-                # ORB construction (09:18 and 09:21 start buckets)
-                dt = epoch_to_local_dt(bucket)
-                hm = dt.hour * 60 + dt.minute
+                dt      = epoch_to_local_dt(bucket)
+                hm      = dt.hour * 60 + dt.minute
                 day_key = dt.strftime('%Y-%m-%d')
                 if eng.current_session_date != day_key:
                     eng._reset_daily_orb_locked(day_key)
 
+                # ── ORB construction — ALWAYS process from history ─────────────
+                # These two specific candles define the ORB range.
+                # Must be built even when starting after 09:24 so the
+                # ORB H/L is available for the pre-10 strategy and dashboard.
                 if hm in (9 * 60 + 18, 9 * 60 + 21):
                     eng.orb_high = h if eng.orb_high is None else max(float(eng.orb_high), h)
                     eng.orb_low  = l if eng.orb_low  is None else min(float(eng.orb_low),  l)
@@ -2085,12 +2125,27 @@ class App:
                     if eng.orb_bars_count >= 2:
                         eng.orb_ready = True
                         eng.last_strategy_note = f'ORB ready H={eng.orb_high:.2f} L={eng.orb_low:.2f}'
+                        _append_to_session_log(
+                            f'{inst["name"]:<20} ORB READY'
+                            f' H={eng.orb_high:.2f} L={eng.orb_low:.2f}'
+                            f' range={eng.orb_high-eng.orb_low:.2f}', 'ORB')
                     else:
                         eng.last_strategy_note = 'waiting for ORB levels'
+                        _append_to_session_log(
+                            f'{inst["name"]:<20} ORB bar #{eng.orb_bars_count}'
+                            f' H={h:.2f} L={l:.2f}', 'ORB')
                     eng.last_strategy_3m_bucket = bucket
                     continue
 
-                # Run strategy on this closed 3m candle
+                # ── Strategy evaluation — only for candles closing AFTER startup ──
+                # Prevents entering trades on historical signals that were already
+                # in the data before we started running (e.g. a 09:30 breakout
+                # signal that existed in REST data when we started at 09:35).
+                if close_bucket <= app_start_epoch:
+                    eng.last_strategy_3m_bucket = bucket   # advance marker, skip eval
+                    continue
+
+                # Run strategy on this live closed 3m candle
                 eng._run_strategy_on_closed_3m_locked(close_bucket, o, h, l, c)
 
                 # Candle log
@@ -2132,7 +2187,10 @@ class App:
 
         while not self.stop_evt.is_set():
             now_ts    = time.time()
-            next_wake = ((now_ts // 60) + 1) * 60 + 5.0
+            # 1s buffer: Dhan has no rate limit on minute-TF historical API
+            # (official docs: no per-minute/hour limits, 100k/day only).
+            # 1s ensures the completed 1m candle is published before we fetch.
+            next_wake = ((now_ts // 60) + 1) * 60 + 1.0
             sleep_for = next_wake - now_ts
             if sleep_for > 0:
                 end = time.time() + sleep_for
@@ -2149,7 +2207,7 @@ class App:
                     break
                 candles_1m = self._fetch_1m_candles_for_inst(inst, REFRESH_DAYS)
                 if candles_1m:
-                    self._rebuild_st_from_rest(inst, candles_1m)
+                    self._rebuild_st_from_rest(inst, candles_1m, self.app_start_epoch)
                 time.sleep(0.15)   # stagger between instruments
 
     def squareoff_all(self, reason: str = 'manual squareoff') -> int:
@@ -2238,6 +2296,23 @@ def _append_to_trade_log(trade_line: str, inst_name: str) -> None:
             f.write(f"{ts},{inst_name},{trade_line}\n")
     except Exception:
         pass
+
+def _append_to_session_log(msg: str, category: str = 'INFO') -> None:
+    """Write one line to session.log — the single human-readable log
+    that captures every meaningful event of the trading day in order.
+
+    Categories: SESSION, ORB, ST, STRATEGY, TRADE, WS, ERROR
+    Format:  [HH:MM:SS] [CATEGORY ] message
+    """
+    try:
+        log_file = _today_log_dir() / 'session.log'
+        ts  = now_local().strftime('%H:%M:%S')
+        cat = f'{category:<8}'
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"[{ts}] [{cat}] {msg}\n")
+    except Exception:
+        pass
+
 
 def _append_to_candle_log(inst_name: str, candle_time: str,
                            o: float, h: float, l: float, c: float,
@@ -2331,10 +2406,11 @@ class DashboardRow:
         inst=snap['instrument']; ltp=snap['last_ltp']; prev=snap['prev_close']
         if ltp is not None:
             self.cells['ltp'].configure(text=f"{ltp:,.2f}", text_color=WHITE)
-        if ltp is not None and prev:
+        if ltp is not None and prev and float(prev) > 1.0:
             chg=(ltp-prev)/prev*100
-            col=GREEN if chg>=0 else RED
-            self.cells['chg'].configure(text=f"{_sgn(chg)}{chg:.2f}%", text_color=col)
+            if abs(chg) < 50:   # sanity guard — skip if implausibly large
+                col=GREEN if chg>=0 else RED
+                self.cells['chg'].configure(text=f"{_sgn(chg)}{chg:.2f}%", text_color=col)
         orb_rdy=snap['orb_ready']
         self.cells['orb_h'].configure(text=_fmt(snap['orb_high']),
             text_color=GREEN if orb_rdy else MUTED)
@@ -2969,6 +3045,16 @@ class MainWindow(ctk.CTk):
         threading.Thread(target=_init, daemon=True).start()
 
     def _stop(self):
+        # Write session end summary before clearing _app
+        try:
+            if self._app:
+                tot_pnl  = sum(e.realized_pnl_rupees for e in self._app.engines.values())
+                open_pos = sum(1 for e in self._app.engines.values() if e.position)
+                _append_to_session_log(
+                    f'=== SESSION END | realised_pnl=₹{tot_pnl:+,.2f}'
+                    f' | open_positions_remaining={open_pos} ===', 'SESSION')
+        except Exception:
+            pass
         if self._app: self._app.stop(); self._app=None
         self._running=False
         self.btn_start.configure(text='▶  START',
