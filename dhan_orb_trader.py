@@ -404,8 +404,12 @@ def is_market_time(dt: datetime, exchange: str = 'NSE_EQ') -> bool:
     if exchange == 'MCX_COMM':
         # MCX commodity market: 09:00 – 23:30 IST
         return 9 * 60 <= hm <= 23 * 60 + 30
-    # NSE/BSE equity + F&O: 09:15 – 15:30 IST
-    return 9 * 60 + 15 <= hm <= 15 * 60 + 30
+    # NSE/BSE equity + F&O: 09:15 – 15:29 IST (strict < 15:30)
+    # We EXCLUDE the 15:30 bar because the REST API returns a synthetic NSE
+    # closing auction candle at 15:30 where H=L=C (TR=0). Including this
+    # zero-range bar reduces ATR by 10%, causing 3-4 rupee ST divergence at
+    # the next day's open that only dissipates over 40+ bars into the session.
+    return 9 * 60 + 15 <= hm < 15 * 60 + 30
 
 
 def now_local() -> datetime:
